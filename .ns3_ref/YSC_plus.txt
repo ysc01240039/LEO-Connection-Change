@@ -1,0 +1,160 @@
+\section{实验设计}
+
+\subsection{仿真平台与星座配置}
+
+本文采用 \textsc{ns-3} 卫星网络仿真模块（\texttt{satellite} 模块）构建仿真环境。轨道数据通过 \textsc{STK} 生成后导入，或使用 \textsc{ns-3} 内置的 \texttt{Orbit} 模型生成 Walker 星座。具体配置如表 \ref{tab:constellation} 所示。
+
+\begin{table}[H]
+\centering
+\caption{星座配置}
+\label{tab:constellation}
+\begin{tabular}{lcccccc}
+\toprule
+层级 & 卫星数量 & 轨道高度 & 轨道面数 & 每面卫星数 & 倾角 & 覆盖区域 \\
+\midrule
+LEO & 1008 & 550 km & 24 & 42 & 53$^\circ$ & 全球 \\
+MEO & 12 & 20000 km & 3 & 4 & 55$^\circ$ & 全球（区域划分） \\
+GEO & 2 & 35786 km & 1 & 2 & 0$^\circ$ & 全球（覆盖东西半球） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{itemize}
+    \item \textbf{LEO星座}：参考 Starlink 第一阶段部署规模，共 1008 颗卫星，轨道高度 550 km，倾角 53$^\circ$，每个轨道面 42 颗卫星，共 24 个轨道面。
+    \item \textbf{MEO星座}：12 颗卫星，分布在 3 个轨道面，每个轨道面 4 颗卫星，轨道高度 20000 km，用于区域协调。每个 MEO 管辖一个地理区域，区域半径约 3000 km，区域之间存在重叠。
+    \item \textbf{GEO星座}：2 颗静止轨道卫星，分别覆盖东经 80$^\circ$ 和 120$^\circ$（覆盖中国及周边区域），用于全局监测、应急广播和参数中继。
+\end{itemize}
+
+可见性计算：基于星历和轨道传播，每隔 1 秒计算一次卫星间可见性（距离 $\le 5000$ km 且仰角 $\ge 10^\circ$）。星间链路传播时延按光速计算，链路带宽根据卫星类型设定（LEO: 100 Mbps，MEO: 200 Mbps，GEO: 500 Mbps）。
+
+\subsection{任务生成模型}
+
+任务类型分为 5 种：遥感、通信、导航、科学观测、应急响应，每种类型对应不同的资源需求（数据量 $1$–$100$ MB）和紧急权重（$0$–$1$）。任务到达服从泊松过程，平均到达率 $\lambda = 10$ tasks/s（全局），突发场景下局部区域到达率增至 $100$ tasks/s。每个任务被随机分配到某个地面站或直接注入到其覆盖的 LEO 卫星。仿真时长为 24 小时。
+
+\subsection{对比方法}
+
+为全面评估性能，选取以下 6 种方法进行对比：
+
+\begin{enumerate}
+    \item \textbf{集中式最优（上界）}：地面中心收集所有卫星状态，使用 Gurobi 求解整数规划（仅在小规模、短时间窗口下运行，作为性能上界）。
+    \item \textbf{纯本地随机}：LEO 收到任务后，从可见邻居中随机选择执行卫星。
+    \item \textbf{经典分布式协商（CNP）}：基于合同网协议，任务发起者广播需求，收到投标后选择中标者。
+    \item \textbf{深度强化学习（DRL）}：基于近端策略优化（PPO）的星上调度，每颗卫星独立学习决策策略（参考文献 [ICC 2023]）。
+    \item \textbf{图神经网络（GNN）}：基于图注意力网络的分布式调度，每个节点聚合邻居信息进行决策（参考文献 [INFOCOM 2024]）。
+    \item \textbf{本文方法}：包含所有核心模块（缓存优先、动态概率、异步学习、预测性缓存、跨区域协调）。
+    \item \textbf{消融变体}：
+        \begin{itemize}
+            \item w/o cache：移除 LEO 缓存，所有决策均请求 MEO。
+            \item w/o dynamic p：固定 $p_{\text{exact}} = 0.01$。
+            \item w/o prefetch：移除预测性缓存预取。
+            \item w/o async learning：参数固定，不进行地面云更新。
+            \item w/o cross-region：禁用跨区域协调，任务只能在本区域完成。
+        \end{itemize}
+\end{enumerate}
+
+\subsection{评估指标}
+
+\begin{itemize}
+    \item \textbf{任务完成率}：整体完成率、紧急任务完成率、不同类型任务完成率。
+    \item \textbf{决策时延}：均值、P50、P90、P99，并绘制累积分布函数（CDF）曲线。
+    \item \textbf{缓存命中率}：LEO 本地缓存命中率，按时段和任务类型统计。
+    \item \textbf{通信开销}：星间通信总字节数、平均链路利用率。
+    \item \textbf{能量消耗}：卫星平均能耗、总能耗。
+    \item \textbf{鲁棒性}：故障恢复时间（LEO 失效后任务重分配完成时间）、MEO 失效后任务完成率下降幅度。
+    \item \textbf{跨区域协调}：跨区域任务比例、跨区域任务平均时延。
+    \item \textbf{负载均衡}：不同 MEO 区域的任务完成率差异、资源利用率标准差。
+\end{itemize}
+
+\subsection{实验场景与设计}
+
+为全面验证系统性能，设计以下 7 组实验，每组实验重点关注不同方面。
+
+\subsubsection{场景 1：稳态性能评估}
+
+\begin{itemize}
+    \item \textbf{目的}：评估系统在常规任务负载下的长期平均性能。
+    \item \textbf{设置}：任务均匀到达，全局到达率 $\lambda = 10$ tasks/s，仿真 24 小时。
+    \item \textbf{测量指标}：任务完成率、决策时延（CDF）、缓存命中率随时间变化、通信开销、能量消耗。
+    \item \textbf{对比}：本文方法 vs. 所有对比方法 vs. 消融变体。
+    \item \textbf{预期}：本文方法在时延和通信开销上显著优于其他方法，完成率接近集中式上界。
+\end{itemize}
+
+\subsubsection{场景 2：突发应急响应}
+
+\begin{itemize}
+    \item \textbf{目的}：验证事件驱动机制在突发负载下的快速响应能力。
+    \item \textbf{设置}：在仿真第 1 小时，随机选择一个区域（MEO 管辖范围），将任务到达率提升至 $100$ tasks/s，持续 10 分钟，其余时间保持稳态。
+    \item \textbf{测量指标}：突发期间任务完成率、决策时延变化、$p_{\text{exact}}$ 动态调整过程、GEO 应急广播触发次数。
+    \item \textbf{对比}：本文方法 vs. 无动态概率（固定 $p=0.01$） vs. 无 GEO 广播（MEO 自行调节）。
+    \item \textbf{预期}：本文方法能快速调高 $p_{\text{exact}}$，保持高完成率，时延波动小。
+\end{itemize}
+
+\subsubsection{场景 3：拓扑高动态性}
+
+\begin{itemize}
+    \item \textbf{目的}：测试在极地区域等高动态环境下，缓存失效与恢复能力。
+    \item \textbf{设置}：仿真模拟卫星经过极地区域（纬度 $>70^\circ$），可见性变化剧烈，链路频繁中断。
+    \item \textbf{测量指标}：缓存命中率随时间变化、任务重分配次数、任务完成率。
+    \item \textbf{对比}：本文方法 vs. 无预测性缓存 vs. 固定 TTL（300s）。
+    \item \textbf{预期}：预测性缓存能提前预热，降低缓存失效影响，完成率保持稳定。
+\end{itemize}
+
+\subsubsection{场景 4：故障恢复能力}
+
+\begin{itemize}
+    \item \textbf{目的}：评估系统在节点失效情况下的鲁棒性。
+    \item \textbf{设置}：
+        \begin{itemize}
+            \item \textbf{LEO 失效}：在仿真第 2 小时，随机选择 20 颗 LEO 卫星使其失联（停止响应），持续 30 分钟后恢复。
+            \item \textbf{MEO 失效}：在仿真第 3 小时，随机选择 2 颗 MEO 卫星使其失效，持续 30 分钟。
+        \end{itemize}
+    \item \textbf{测量指标}：故障期间任务完成率下降幅度、任务重分配完成时间、恢复后系统性能恢复速度。
+    \item \textbf{对比}：本文方法 vs. 无故障恢复机制（仅依赖本地重试）。
+    \item \textbf{预期}：本文方法能在秒级内完成任务重分配，完成率下降 $<5\%$，恢复后性能快速回到正常水平。
+\end{itemize}
+
+\subsubsection{场景 5：跨区域协调}
+
+\begin{itemize}
+    \item \textbf{目的}：验证当本区域资源不足时，跨区域调度的有效性。
+    \item \textbf{设置}：任务生成时，$10\%$ 的任务被标记为“跨区域需求”（需要两个以上区域的资源协同，例如大范围成像）。这些任务由 GEO 协调完成。
+    \item \textbf{测量指标}：跨区域任务完成率、跨区域任务平均时延（与区域内任务对比）、GEO 广播负载。
+    \item \textbf{对比}：本文方法 vs. 无跨区域协调（任务只能在本区域完成，可能导致部分任务无法分配）。
+    \item \textbf{预期}：跨区域协调能显著提升任务完成率，时延增加在可接受范围内（增加一次 GEO 中继）。
+\end{itemize}
+
+\subsubsection{场景 6：重叠区域负载均衡}
+
+\begin{itemize}
+    \item \textbf{目的}：验证 MEO 覆盖重叠区域在负载均衡和容错中的作用。
+    \item \textbf{设置}：人为使某个 MEO 区域负载增加 3 倍（通过增加任务到达率），观察重叠区域的其他 MEO 是否自动接管部分任务。
+    \item \textbf{测量指标}：各 MEO 区域的任务完成率、负载均衡度（基尼系数）、任务重分配次数。
+    \item \textbf{对比}：有重叠区域（默认） vs. 无重叠区域（通过修改 MEO 覆盖半径，使区域不重叠）。
+    \item \textbf{预期}：有重叠时，负载高的区域任务能被相邻 MEO 分担，完成率更高，负载更均衡。
+\end{itemize}
+
+\subsubsection{场景 7：参数敏感性与可扩展性}
+
+\begin{itemize}
+    \item \textbf{目的}：评估关键参数对性能的影响，以及系统在大规模星座下的可扩展性。
+    \item \textbf{设置}：
+        \begin{itemize}
+            \item \textbf{参数敏感性}：改变候选数量 $K$（1, 3, 5, 10）、TTL（60, 300, 600, 1200 s）、窗口大小 $W$（30, 60, 120, 300 s）、多目标权重 $\lambda_1$（0.5, 0.7, 0.9），观察性能变化。
+            \item \textbf{可扩展性}：改变 LEO 数量（100, 500, 1000, 2000），测量决策时延、通信开销、缓存命中率随规模增长的趋势。
+        \end{itemize}
+    \item \textbf{测量指标}：任务完成率、决策时延、缓存命中率随参数变化曲线；系统性能随规模变化曲线。
+    \item \textbf{对比}：本文方法 vs. 集中式（小规模）和 DRL 方法。
+    \item \textbf{预期}：本文方法在参数变化下保持稳健性能，且随规模增长性能呈亚线性下降，优于其他方法。
+\end{itemize}
+
+\subsection{统计分析}
+
+每组实验独立运行 30 次（不同随机种子），结果以“均值 $\pm$ 标准差”形式给出，并采用 $t$ 检验（显著性水平 $p < 0.05$）验证本文方法与对比方法的差异是否显著。
+
+\subsection{硬件环境}
+
+仿真运行在服务器上，配置：Intel Xeon Gold 6248R CPU（24 核），128 GB RAM，Ubuntu 20.04。\textsc{ns-3} 采用并行仿真模式，24 线程并行，单次仿真（24 小时，1008 颗卫星）约需 2 小时。
+
+\section{实验结果与讨论}
+
+（此处将在实际仿真后补充图表和详细分析）

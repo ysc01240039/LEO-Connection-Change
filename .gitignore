@@ -3,3 +3,17 @@
 
 # 按需求排除的清单文件
 姚世宸_前置任务清单.md
+
+# 第三方仿真模块 vendor（ns3-ntn-toolkit 等，已克隆但未构建/未集成）
+vendor/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 仿真生成产物（输入保留可复现，产物不入库；再次运行一键再生成）
+data/sim/ns3_out/
+data/sim/*.csv
+data/sim/*.json
+data/sim/*.png
+data/sim/*.html
