@@ -104,24 +104,6 @@ def _sim_core(sc, group, seed, params, no_link):
     return metrics, trace, summary, windows, prov
 
 
-def _sim_core_reps(sc, group, seed, reps, params, no_link):
-    """多种子核心仿真：真实 TLE → 可见窗（仅一次）→ 协议模型（reps 次）→ 指标。
-    返回 (merged_metrics, metrics_list, last_trace, last_summary)。
-    ★P0-4★：对照类子实验（rel17/ablation/t8/premigrate）此前单种子无置信度，
-    现统一走本函数，reps≥2 时 merged_metrics 带 _stdev，供 CI 与稳健性判断。"""
-    sats, prov = fetch_tle(group)
-    ts = build_timescale()
-    windows, _ = compute_access(sats, sc["lat"], sc["lon"], sc["alt_m"], ts)
-    ms = []
-    lt = ls = None
-    for r in range(max(1, reps)):
-        trace, summary = run_protocol(windows, sc, sats=sats, ts=ts,
-                                      rng_seed=seed + r, params=params)
-        ms.append(compute_metrics(trace, summary))
-        lt, ls = trace, summary
-    return merge_reps(ms), ms, lt, ls
-
-
 def _merge_improvements(imp_list):
     """合并多种子 rel17_improvement() 结果：数值键取均值±标准差，非数值键取首个。
     ★P0-4★：让「相对 Rel-17 提升%」这一 headline 具备多种子置信度，而非单种子点估计。"""

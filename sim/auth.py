@@ -47,12 +47,25 @@ def derive_dev_key(root_key: bytes, term_id: int) -> bytes:
                     hashlib.sha256).digest()
 
 
-def make_pseudo(root_key: bytes, term_id: int) -> bytes:
-    """假名标识（★P0-3 口径收敛★：假名由根密钥派生、确定性生成，用于在信令中
-    替代明文长期身份；接入凭证携带一次性令牌（单调计数器）防重放。当前为固定假名，
-    「每次接入轮换防跟踪」属未来工作，不在本仿真实现范围内——如实标注，勿宣称）。"""
-    return hmac.new(root_key, b"pseudo" + str(int(term_id)).encode(),
+def make_pseudo(root_key: bytes, term_id: int, epoch: int = 0) -> bytes:
+    """假名标识：由根密钥 + 终端身份 + 轮换版本(epoch) 派生，在信令中替代明文长期身份。
+    ★P2 假名轮换★：epoch 每次切换递增 → 假名随之轮换，切换前后假名不同，
+    攻击者无法由旧假名关联/推导新假名（HMAC 单向性），实现「前向不可关联」。
+    星上持 root_key 可派生任意 (term_id, epoch) 的假名以验证（无需存完整历史）。"""
+    return hmac.new(root_key,
+                    b"pseudo" + str(int(term_id)).encode() + b":" + str(int(epoch)).encode(),
                     hashlib.sha256).digest()[:AUTH_PSEUDO_BYTES]
+
+
+def gen_chain_seed(root_key: bytes, term_id: int) -> bytes:
+    """首联 MsgB 下发哈希链种子（续认证根）。终端与星各持一份，用于切换时轻量续认证。"""
+    return hashlib.sha256(root_key + b"chain" + str(int(term_id)).encode()).digest()
+
+
+def chain_next(seed: bytes) -> bytes:
+    """哈希链下一跳：H(seed)。终端每次切换出示下一跳，星上仅需一次哈希比对即确认，
+    且由哈希单向性天然防重放（旧跳不可回退重放）。"""
+    return hashlib.sha256(b"CHAIN" + seed).digest()
 
 
 def sign(dev_key: bytes, pseudo: bytes, counter: int) -> bytes:

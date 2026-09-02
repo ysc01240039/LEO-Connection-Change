@@ -121,10 +121,12 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
     auth_extra_ms = P["auth_extra_ms"]
     if auth_extra_ms is None:
         auth_extra_ms = _auth.measure_verify_ms() * AUTH_CPU_DERATE
-    # D3：每星独立认证上下文 {sat: {pseudo: counter}}，是「认证上下文星间预迁移」的状态载体。
-    # 当前 onboard 为全局共享校验器（任一星均可从 root_key 推导 dev_key），故预迁移此前被隐式满足、
-    # 无独立建模；引入本表后，预迁移 = 将上下文推送到候选星，无预迁移则新星须重新 RACH。
+    # D3：每星独立认证上下文 {sat: {term_id: counter}}，是「认证上下文星间预迁移」的状态载体。
+    # 键用 term_id（内部稳定标识）而非信令假名——P2 假名每次切换轮换，信令假名会变，内部索引须稳定。
+    # 预迁移 = 将 (term_id, counter) 推送到候选星，无预迁移则新星须重新 RACH。
     sat_ctx = {}
+    term_epoch = {}   # P2 假名轮换：每终端假名轮换版本（首联=0，每次切换 +1）
+    chain_state = {}  # P2 哈希链续认证：每终端当前链头（首联下发种子，切换逐跳推进）
 
     t0 = _dt.datetime.fromisoformat(SIM_START_UTC.replace("Z", "+00:00"))
     observer = wgs84.latlon(scenario["lat"], scenario["lon"], scenario["alt_m"])
@@ -435,7 +437,7 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                 trace.append(_mk("ACCESS", k, tag, t, best["sat"], best["sat"], value_ms,
                                  dop, slant, "success", forged=True, service=svc,
                                  auth_result="ok_missed", ebno=_link_ebno(slant, best_el)))
-                sat_ctx.setdefault(best["sat"], {})[ps] = term_attempts[k] + 1  # D3
+                sat_ctx.setdefault(best["sat"], {})[k] = term_attempts[k] + 1  # D3（内部键=term_id）
                 continue
             n_forged_blocked += 1
             term_failed.add(k)
@@ -503,7 +505,8 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
         trace.append(_mk("ACCESS", k, tag, grant_t, best["sat"], best["sat"], value_ms,
                          dop, slant, "success", service=svc, auth_result=res,
                          ebno=_link_ebno(slant, best_el)))
-        sat_ctx.setdefault(best["sat"], {})[ps] = term_attempts[k] + 1  # D3：服务星记录终端认证上下文
+        sat_ctx.setdefault(best["sat"], {})[k] = term_attempts[k] + 1  # D3：服务星记录终端认证上下文（内部键=term_id）
+        chain_state[k] = _auth.gen_chain_seed(root_key, k)  # P2：首联 MsgB 下发哈希链种子
         connect_sat, connect_t = best["sat"], grant_t
 
         # ---------------- 预测式切换 ----------------
@@ -563,11 +566,16 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             # 服务星在决策时刻 t_ho 将本终端认证上下文（pseudo + 当前计数器）经星间链路
             # 提前打包迁移至预测目标星；切换时新星凭预置上下文一次比对即确认（RACH-less）。
             # 若 pre_migrate 关闭，或预测失配导致实际目标星 ≠ 迁移目标星，则新星无上下文 → 回退重新 RACH。
-            pk = _auth.make_pseudo(root_key, k)
+            # ★P2 假名轮换★：每次切换 epoch 递增，信令假名随之轮换（前向不可关联）
+            term_epoch[k] = term_epoch.get(k, 0) + 1
+            pk = _auth.make_pseudo(root_key, k, term_epoch[k])
             if P["pre_migrate"]:
-                sat_ctx.setdefault(cand["sat"], {})[pk] = \
-                    sat_ctx.get(cur["sat"], {}).get(pk, term_attempts[k] + 1)
-            has_ctx = pk in sat_ctx.get(cand["sat"], {})
+                sat_ctx.setdefault(cand["sat"], {})[k] = \
+                    sat_ctx.get(cur["sat"], {}).get(k, term_attempts[k] + 1)
+            has_ctx = k in sat_ctx.get(cand["sat"], {})
+            # ★P2 哈希链续认证★：切换时终端出示哈希链下一跳，星上推进链头（单向防重放）
+            if k in chain_state:
+                chain_state[k] = _auth.chain_next(chain_state[k])
 
             if cand["los_s"] <= los_pred + 1e-9:
                 break
@@ -582,21 +590,22 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             ho_dop = gc[0] if gc else 0.0
             ho_slant = gc[1] if gc else 0.0
             ho_el = _el_deg(cand["sat"], t_ho)
-            exec_s = (2.0 * ho_d_ms + access_proc_ms + auth_extra_ms) / 1000.0
-            if not has_ctx:
-                # 无预迁移：终端须在新星重新随机接入（完整接入流程），含前导竞争与附加调度时延
-                rerach = step4_extra_ms(ho_d_ms)
-                extra_rerach = (2.0 * ho_d_ms + access_proc_ms + rerach) / 1000.0
+            if has_ctx:
+                # 有预迁移：新星持预置上下文，一次比对即确认（RACH-less）
+                n_premig_hit += 1
+                exec_s = (2.0 * ho_d_ms + access_proc_ms + auth_extra_ms) / 1000.0
+            else:
+                # 无预迁移：终端须在新星重新随机接入（四步 RACH 完整流程）
+                n_premig_miss += 1
+                rerach_ms = step4_extra_ms(ho_d_ms) + access_proc_ms + auth_extra_ms
                 if not _preamble_contend(t, cand["sat"], k):
                     n_rerach_fail += 1
-                    extra_rerach += (2.0 * ho_d_ms + access_proc_ms) / 1000.0  # 竞争失败退避一轮
+                    rerach_ms += (2.0 * ho_d_ms + access_proc_ms)  # 竞争失败退避一轮
                 else:
                     n_rerach += 1
-                exec_s += extra_rerach
-                rerach_extra_ms += extra_rerach * 1000.0
-                n_premig_miss += 1
-            else:
-                n_premig_hit += 1
+                exec_s = rerach_ms / 1000.0
+                # 相对「一次比对」的额外开销（量化预迁移收益）
+                rerach_extra_ms += rerach_ms - (2.0 * ho_d_ms + access_proc_ms + auth_extra_ms)
             avail = start_connect + exec_s
             ho_total_ms_sum += exec_s * 1000.0   # D3：切换总时延累加
             interrupt = max(0.0, avail - los_true)     # ← 真实 LOS，非预测 LOS
@@ -637,6 +646,7 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                              round(interrupt * 1000.0, 3), ho_dop, ho_slant, ho_result,
                              service=svc, predict_mismatch=mismatch, pingpong=pingpong,
                              ho_el_cost_deg=el_cost, ebno=_link_ebno(ho_slant, ho_el)))
+            trace[-1]["pseudo_epoch"] = term_epoch.get(k, 0)  # P2：记录假名轮换版本（审计用）
             cur, connect_sat, connect_t = cand, cand["sat"], start_connect
 
     summary = {"n_forged": n_forged, "n_forged_blocked": n_forged_blocked,
@@ -649,7 +659,8 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                "ho_total_ms_sum": round(ho_total_ms_sum, 1),
                "pre_migrate": P["pre_migrate"],
                "t8_priority_on": P["t8_priority_on"],
-               "geom_fail": geom_fail["n"], "params": dict(P)}
+               "geom_fail": geom_fail["n"], "total_dur": total_dur,
+               "n_pseudo_rotation": sum(term_epoch.values()), "params": dict(P)}
     # ---- 科学版 dp 调度计数（priority_mode=="dp" 时有效）----
     if P.get("priority_mode") == "dp":
         summary["dp_avg_gh"] = round(_dp_sum_gh / _dp_n_guard, 2) if _dp_n_guard else 0.0

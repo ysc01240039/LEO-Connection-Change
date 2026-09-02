@@ -110,6 +110,13 @@ def compute_metrics(trace: list, summary: dict | None = None) -> dict:
             m["伪造终端总数(抽样)"] = summary["n_forged"]
         if summary.get("geom_fail"):
             m["几何计算失败次数"] = summary["geom_fail"]
+        # ---- RACH 吞吐：单位时间成功接入的合法终端数（终端/秒）----
+        if summary.get("total_dur"):
+            n_succ = sum(1 for e in legit if e.get("result") == "success")
+            m["RACH吞吐_终端每秒"] = round(n_succ / summary["total_dur"], 4)
+        # ---- P2 假名轮换：切换时轮换假名的总次数（可审计「每次切换轮换」）----
+        if summary.get("n_pseudo_rotation"):
+            m["假名轮换次数"] = summary["n_pseudo_rotation"]
 
     dop = [abs(_f(e["doppler_hz"])) for e in trace if _f(e["doppler_hz"]) != 0.0]
     m["多普勒最大值_Hz"] = round(max(dop), 1) if dop else 0.0
