@@ -13,7 +13,15 @@ __pycache__/
 
 # 仿真生成产物（输入保留可复现，产物不入库；再次运行一键再生成）
 data/sim/ns3_out/
+data/sim/runs/
 data/sim/*.csv
 data/sim/*.json
 data/sim/*.png
 data/sim/*.html
+
+# 性能诊断脚本（data/sim 下临时工具，不入库）
+data/sim/perf_read.py
+data/sim/perf_scale.py
+
+# Python 性能剖析二进制（不入库）
+*.prof

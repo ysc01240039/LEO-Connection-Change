@@ -1,5 +1,5 @@
 """轨道与可见性计算（REPLACEABLE：可换为 STK/其他星历）。
-使用真实 TLE + skyfield，全部为真实计算，无硬编码。"""
+使用真实 TLE + skyfield，星历与几何全部来自真实计算（非写死常量）；设备/协议层参数为 config.py 中的显式建模假设。"""
 from datetime import datetime, timedelta
 import numpy as np
 from skyfield.api import load, EarthSatellite, wgs84

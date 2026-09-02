@@ -20,6 +20,7 @@
 #include "ns3/mobility-module.h"
 
 #include <cmath>
+#include <cstring>
 #include <map>
 #include <vector>
 #include <string>
@@ -60,19 +61,50 @@ static double g_tickS = 1.0;
 static double g_accessProcMs = 3.0;
 static double g_simDur = 3600.0;
 // ---- T4 认证 / RACH 基线 / 碰撞拥塞（与 Python 轨 scenario.py 同参）----
-static double     g_authExtraMs    = 0.0;    // 星上轻量凭证校验额外时延(ms)
-static double     g_step4ExtraMs   = 400.0;  // 四步 RACH 附加时延(ms，RAR 等待+竞争解决)
+static double     g_authExtraMs    = 0.0;    // 星上轻量凭证校验额外时延(ms，实测折算)
 static uint32_t   g_rachSteps      = 2;      // 2=两步预补偿；4=Rel-17 四步基线
-static double     g_forgedRatio    = 0.0;    // 伪造终端占比（dev_sig 校验失败→拦截）
+static double     g_forgedRatio    = 0.0;    // 伪造终端占比
+static double     g_compromisedShare = 0.15; // 伪造终端中持有效密钥比例（→漏检率）
 static bool       g_collisionOn    = false;  // 碰撞/拥塞模型开关
-static uint32_t   g_rachCapacity   = 64;     // 每 10ms 时间片星上前导码受理上限
+static uint32_t   g_rachCapacity   = 64;     // 每 10ms 时间片星上受理上限
 static double     g_retryIntervalMs = 500.0; // 碰撞退避均匀抽样上限(ms)
 static uint32_t   g_retryMax       = 20;     // 碰撞重试上限（超限判失败）
+// ---- ★审计修复 2026-09-02：新增机理参数（与 sim/config.py 同参）----
+static double     g_ephemErrS      = 0.0;    // 星历预测误差 σ(s)：0=完美预测
+static double     g_wEl            = 0.5;    // 选星仰角权重
+static double     g_wDwell         = 0.5;    // 选星驻留权重
+static double     g_hoHyst         = 0.0;    // 切换迟滞（score 单位）
+static uint32_t   g_rarWindowMs    = 160.0;  // 四步 RAR 响应窗口(ms)
+static uint32_t   g_contTimerMs    = 200.0;  // 四步竞争解决定时器(ms)
+static uint32_t   g_nPreamble      = 64;     // 前导码数量（四步竞争）
+static double     g_eirpDbm        = 68.0;   // 卫星 EIRP(dBm)
+static double     g_gtDbiK         = -20.0;  // 终端 G/T(dB/K)
+static double     g_noiseTempK     = 290.0;  // 噪声温度(K)
+static double     g_bitRateBps     = 100e3;  // 业务速率(bps)
+static bool       g_linkModelOn    = true;   // 链路模型开关
+static uint64_t   g_rngSeed        = 20260901; // 运行种子（★可配置，原固定 12345★）
+static uint32_t   g_macBytes       = 4;      // MAC 截断长度(字节) → 盲猜 2^-32
 static std::map<std::pair<uint32_t,uint32_t>, uint32_t> g_slotLoad; // (sat,10ms槽)->已受理数
+static std::map<std::tuple<uint32_t,uint32_t,uint32_t>, uint32_t> g_preambleUse; // (sat,槽,前导)->终端
+static std::map<uint32_t, uint32_t> g_lastCounter;  // pseudo -> 已见最大 counter（重放检测）
 static std::mt19937 g_runRng(20260901);                            // 运行时退避 RNG
 static std::uniform_real_distribution<double> g_u01(0.0, 1.0);
+
+// ---- ★生存优先分级调度（★镜像 sim/protocol.py _slot_ok / PRIO_BACKOFF★）----
+// 原 ns-3 轨仅给终端贴 high/med/low 标签，但 RACH 拥塞下各 tier 平等竞争，
+// 「指挥/救援终端优先接入」并未真正生效。现镜像 Python 轨 priority-aware RACH（三池版）：
+//   · high/med/low 各占专用预留池（比例见 g_prioReserveFrac[3]，同 config.PRIORITY_RESERVE_FRAC），
+//     严格隔离 → high>med>low 单调成立（消除原 2 池 med<low 假象）；
+//   · 高优退避更短 → 重发更快、接入时延更低。
+// priority_on=False 时为「无优先级基线」（所有 tier 共用单池 g_slotLoad），用于量化增益。
+static bool       g_priorityOn     = true;  // 生存优先调度开关（default true，同 config）
+static double     g_prioReserveFrac[3] = {0.5, 0.3, 0.2}; // high/med/low 专用预留比例（同 config.PRIORITY_RESERVE_FRAC）
+static double     g_prioBackoff[3] = {0.3, 0.6, 1.0}; // high/med/low 退避缩放（同 config.PRIO_BACKOFF）
+static std::map<std::pair<uint32_t,uint32_t>, uint32_t> g_slotP[3]; // 三档专用池 (sat,10ms槽)->已受理数
 static std::ofstream g_trace;
-static uint64_t g_dbg_attempt = 0, g_dbg_req = 0, g_dbg_forged_blocked = 0, g_dbg_collision_fail = 0;
+static uint64_t g_dbg_attempt = 0, g_dbg_req = 0, g_dbg_forged_blocked = 0,
+                g_dbg_collision_fail = 0, g_dbg_forged_missed = 0,
+                g_dbg_confirm_fail = 0;
 
 // ============================ 向量/几何辅助 ============================
 static double norm3(const Ecef& a){ return std::sqrt(a.x*a.x+a.y*a.y+a.z*a.z); }
@@ -143,6 +175,195 @@ visibleAt(uint32_t termId, double t){
   return out;
 }
 
+// ============================ 生存优先 RACH 容量判定（★镜像 Python protocol._slot_ok★） ============================
+// 优先级映射：high=0 / med=1 / low=2（同 config.TIER_ORDER）。
+// priority_on=False：所有 tier 共用单池 g_slotLoad（无优先级基线）。
+static double prioBackoffScale(uint32_t prio){
+  if (!g_priorityOn) return 1.0;
+  if (prio < 3) return g_prioBackoff[prio];
+  return 1.0;
+}
+static bool slotOk(uint32_t satId, double t, uint32_t prio){
+  if (!g_collisionOn) return true;
+  uint32_t slot10 = (uint32_t)(t / 0.01);
+  if (!g_priorityOn){
+    auto key = std::make_pair(satId, slot10);
+    uint32_t used = g_slotLoad.count(key) ? g_slotLoad[key] : 0;
+    if (used >= g_rachCapacity) return false;
+    g_slotLoad[key] = used + 1;
+    return true;
+  }
+  // 三档专用池容量（余数归 low，保证总容量=rach_capacity）
+  uint32_t cap[3];
+  cap[0] = std::max(1u, (uint32_t)(g_rachCapacity * g_prioReserveFrac[0]));
+  cap[1] = std::max(1u, (uint32_t)(g_rachCapacity * g_prioReserveFrac[1]));
+  cap[2] = (g_rachCapacity > cap[0] + cap[1]) ? (g_rachCapacity - cap[0] - cap[1]) : 1u;
+  // 严格三池：先占本档专用池；不向低优档借用（避免重演 med<low）
+  for (uint32_t p = prio; p < 3; ++p){
+    auto key = std::make_pair(satId, slot10);
+    uint32_t used = g_slotP[p].count(key) ? g_slotP[p][key] : 0;
+    if (used < cap[p]){ g_slotP[p][key] = used + 1; return true; }
+  }
+  return false;
+}
+
+// ============================ SHA-256 / HMAC-SHA256 ============================
+// ★审计修复 2026-09-02★：原 T4 认证为「读终端自报 forged 比特」的 Mock，
+// 拦截率恒 1.0（同义反复）。以下为真实密码学校验（FIPS 180-4 标准实现）。
+static const uint32_t SHA256_K[64] = {
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+static uint32_t rotr32(uint32_t x, int n){ return (x >> n) | (x << (32 - n)); }
+
+static void sha256(const uint8_t* data, size_t n, uint8_t out[32]){
+  uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+                   0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+  auto compress = [&](const uint8_t* p){
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++)
+      w[i] = (uint32_t(p[4*i])<<24)|(uint32_t(p[4*i+1])<<16)|(uint32_t(p[4*i+2])<<8)|p[4*i+3];
+    for (int i = 16; i < 64; i++){
+      uint32_t s0 = rotr32(w[i-15],7) ^ rotr32(w[i-15],18) ^ (w[i-15]>>3);
+      uint32_t s1 = rotr32(w[i-2],17) ^ rotr32(w[i-2],19) ^ (w[i-2]>>10);
+      w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+    for (int i = 0; i < 64; i++){
+      uint32_t S1 = rotr32(e,6) ^ rotr32(e,11) ^ rotr32(e,25);
+      uint32_t ch = (e & f) ^ ((~e) & g);
+      uint32_t t1 = hh + S1 + ch + SHA256_K[i] + w[i];
+      uint32_t S0 = rotr32(a,2) ^ rotr32(a,13) ^ rotr32(a,22);
+      uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
+      uint32_t t2 = S0 + mj;
+      hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+  };
+  uint64_t bits = uint64_t(n) * 8;
+  size_t full = n / 64;
+  for (size_t i = 0; i < full; i++) compress(data + i*64);
+  uint8_t tail[128]; size_t rem = n - full*64;
+  memset(tail, 0, sizeof(tail));
+  memcpy(tail, data + full*64, rem);
+  tail[rem] = 0x80;
+  size_t padLen = (rem < 56) ? 64 : 128;
+  for (int i = 0; i < 8; i++) tail[padLen-8+i] = uint8_t(bits >> (56 - 8*i));
+  compress(tail);
+  if (padLen == 128) compress(tail + 64);
+  for (int i = 0; i < 8; i++){
+    out[4*i]   = uint8_t(h[i]>>24); out[4*i+1] = uint8_t(h[i]>>16);
+    out[4*i+2] = uint8_t(h[i]>>8);  out[4*i+3] = uint8_t(h[i]);
+  }
+}
+
+// HMAC-SHA256(key, msg) → out[32]（FIPS 198-1）
+static void hmacSha256(const uint8_t* key, size_t klen,
+                       const uint8_t* msg, size_t mlen, uint8_t out[32]){
+  uint8_t k0[64]; memset(k0, 0, 64);
+  if (klen > 64){ sha256(key, klen, k0); }
+  else { memcpy(k0, key, klen); }
+  uint8_t ipad[64], opad[64];
+  for (int i = 0; i < 64; i++){ ipad[i] = k0[i]^0x36; opad[i] = k0[i]^0x5c; }
+  uint8_t inner[32];
+  std::vector<uint8_t> buf(64 + mlen);
+  memcpy(buf.data(), ipad, 64); memcpy(buf.data() + 64, msg, mlen);
+  sha256(buf.data(), buf.size(), inner);
+  uint8_t buf2[96];
+  memcpy(buf2, opad, 64); memcpy(buf2 + 64, inner, 32);
+  sha256(buf2, 96, out);
+}
+
+// ============================ T4 凭证体系 ============================
+// dev_key = HMAC(root, "devkey"||term_id)；mac = HMAC(dev_key, pseudo||counter)[:MAC_BYTES]
+static void deriveRootKey(uint8_t out[32]){
+  const char* s = "LEO-EMERG-ROOT";
+  uint8_t sd[64];
+  size_t sl = strlen(s);
+  memcpy(sd, s, sl);
+  // 把种子编码进消息：root = SHA256("LEO-EMERG-ROOT" || seed)
+  uint8_t msg[64+8];
+  memcpy(msg, s, sl);
+  uint64_t v = g_rngSeed;
+  for (int i = 0; i < 8; i++) msg[sl+i] = uint8_t(v >> (56-8*i));
+  sha256(msg, sl+8, out);
+}
+static void deriveDevKey(const uint8_t root[32], uint32_t termId, uint8_t out[32]){
+  uint8_t msg[64];
+  memcpy(msg, root, 32);
+  memcpy(msg+32, "devkey", 6);
+  memcpy(msg+38, &termId, 4);
+  hmacSha256(root, 32, msg, 42, out);
+}
+static void makePseudo(const uint8_t root[32], uint32_t termId, uint8_t out[4]){
+  uint8_t msg[42], mac[32];
+  memcpy(msg, root, 32);
+  memcpy(msg+32, "pseudo", 6);
+  memcpy(msg+38, &termId, 4);
+  hmacSha256(root, 32, msg, 42, mac);
+  memcpy(out, mac, 4);
+}
+static uint32_t readBE32(const uint8_t* p){
+  return (uint32_t(p[0])<<24)|(uint32_t(p[1])<<16)|(uint32_t(p[2])<<8)|p[3];
+}
+static void writeBE32(uint8_t* p, uint32_t v){
+  p[0]=uint8_t(v>>24); p[1]=uint8_t(v>>16); p[2]=uint8_t(v>>8); p[3]=uint8_t(v);
+}
+// sign: HMAC(dev_key, pseudo(4B) || counter(8B))[:MAC_BYTES] → 32bit
+static uint32_t signCred(const uint8_t devKey[32], uint32_t pseudo, uint64_t counter){
+  uint8_t msg[12], mac[32];
+  writeBE32(msg, pseudo);
+  for (int i = 0; i < 8; i++) msg[4+i] = uint8_t(counter >> (56-8*i));
+  hmacSha256(devKey, 32, msg, 12, mac);
+  return readBE32(mac);
+}
+// 星上校验：'o'=ok, 'm'=bad_mac, 'r'=replay
+static char verifyOnboard(const uint8_t devKey[32], uint32_t pseudo, uint64_t counter, uint32_t mac){
+  auto it = g_lastCounter.find(pseudo);
+  if (it != g_lastCounter.end() && counter <= it->second) return 'r';
+  if (signCred(devKey, pseudo, counter) != mac) return 'm';
+  g_lastCounter[pseudo] = counter;
+  return 'o';
+}
+
+// ============================ L2 链路模型（★审计修复★） ============================
+// 原信道层为死代码（无 SNR/丢包，仰角无物理后果）。以下接入完整链路预算：
+//   Eb/N0 = EIRP − FSPL − 30 + 10log10(1/kT) + G/T − 10log10(Rb)
+//   BER(BPSK) = Q(sqrt(2·γ))；MAC 误码破坏概率 = 1−(1−BER)^(8·MAC_BYTES)
+static double fsplDb(double slantKm){
+  double lambda_m = 299792458.0 / g_carrierHz;
+  return 20.0 * std::log10(4.0 * PI * slantKm * 1000.0 / lambda_m);
+}
+static double ebnoDb(double slantKm){
+  double rxDbm = g_eirpDbm - fsplDb(slantKm);
+  double rxDbw = rxDbm - 30.0;
+  double noiseDbwHz = 10.0*std::log10(1.380649e-23) + 10.0*std::log10(g_noiseTempK);
+  return rxDbw - noiseDbwHz + g_gtDbiK - 10.0*std::log10(g_bitRateBps);
+}
+static double qfunc(double x){ return 0.5 * std::erfc(x / std::sqrt(2.0)); }
+static double berOf(double ebnoDbVal){
+  return qfunc(std::sqrt(2.0 * std::pow(10.0, ebnoDbVal/10.0)));
+}
+static double macFailProb(double slantKm){
+  if (!g_linkModelOn || slantKm <= 0) return 0.0;
+  double p = berOf(ebnoDb(slantKm));
+  if (p <= 0) return 0.0;
+  if (p >= 1) return 1.0;
+  return 1.0 - std::pow(1.0 - p, double(8*g_macBytes));
+}
+// 四步相对两步的附加时延（★机理化：原为常量 400ms★）：
+// RAR 窗口 + 竞争解决定时器 + 两个额外几何往返（由斜距实算）
+static double step4ExtraMsCalc(double delayMs){
+  return double(g_rarWindowMs) + double(g_contTimerMs) + 4.0 * delayMs;
+}
+
+
 // ============================ 协议头 ============================
 class LeoHeader : public Header {
 public:
@@ -152,8 +373,11 @@ public:
   uint16_t seq    = 0;
   double   dopplerHz = 0;
   double   taSec  = 0;    // Timing Advance（预补偿）
-  uint8_t  forged = 0;    // 1=伪造终端（星上 dev_sig 校验失败 → 拦截）
   uint8_t  steps  = 0;    // RACH 模式（2=两步；4=四步，供星上附加时延建模）
+  // ---- ★审计修复 2026-09-02：T4 真实凭证字段（原仅有自报 forged 比特）----
+  uint32_t pseudoId = 0;  // 假名标识
+  uint32_t counter  = 0;  // 单调计数（防重放）
+  uint32_t mac      = 0;  // HMAC-SHA256 截断 32bit
 
   static TypeId GetTypeId(){
     static TypeId tid = TypeId("ns3::LeoHeader").SetParent<Header>().SetGroupName("Sim")
@@ -162,20 +386,22 @@ public:
   }
   virtual TypeId GetInstanceTypeId() const { return GetTypeId(); }
   virtual void Print(std::ostream &os) const { os << "Leo msg=" << (int)msgType; }
-  virtual uint32_t GetSerializedSize() const { return 1+4+4+2+8+8+1+1; }
+  virtual uint32_t GetSerializedSize() const { return 1+4+4+2+8+8+1+4+4+4; }
   virtual void Serialize(Buffer::Iterator s) const {
     s.WriteU8(msgType); s.WriteU32(termId); s.WriteU32(satId);
     s.WriteU16(seq);
     s.WriteU64((uint64_t)(int64_t)(dopplerHz*1e6));
     s.WriteU64((uint64_t)(int64_t)(taSec*1e9));
-    s.WriteU8(forged); s.WriteU8(steps);
+    s.WriteU8(steps);
+    s.WriteU32(pseudoId); s.WriteU32(counter); s.WriteU32(mac);
   }
   virtual uint32_t Deserialize(Buffer::Iterator s){
     msgType = s.ReadU8(); termId = s.ReadU32(); satId = s.ReadU32();
     seq = s.ReadU16();
     dopplerHz = (double)(int64_t)s.ReadU64()/1e6;
     taSec = (double)(int64_t)s.ReadU64()/1e9;
-    forged = s.ReadU8(); steps = s.ReadU8();
+    steps = s.ReadU8();
+    pseudoId = s.ReadU32(); counter = s.ReadU32(); mac = s.ReadU32();
     return GetSerializedSize();
   }
 };
@@ -206,15 +432,25 @@ public:
   }
   LeoApp() : m_active(false), m_isTerminal(false), m_nodeId(0), m_termIdx(0), m_satIdx(0),
              m_tag("low"), m_burstT(0), m_accessed(false), m_forged(false),
-             m_retryCnt(0), m_servingSat(0),
-             m_servingLos(0), m_accessFinT(0), m_seq(0) {}
+             m_compromised(false), m_retryCnt(0), m_servingSat(0),
+             m_servingLos(0), m_accessFinT(0), m_prio(2), m_seq(0) {}
   virtual ~LeoApp() {}
 
   void SetTerminal(uint32_t idx, const std::string& tag, double burstT){
     m_isTerminal = true; m_termIdx = idx; m_tag = tag; m_burstT = burstT;
+    // ★生存优先★：tag → 优先级（同 config.TIER_ORDER：high=0/med=1/low=2）
+    m_prio = (tag == "high") ? 0u : (tag == "med") ? 1u : 2u;
   }
   void SetSatellite(uint32_t idx){ m_isTerminal = false; m_satIdx = idx; }
-  void SetForged(bool f){ m_forged = f; }
+  // ★审计修复★：伪造终端分两类——盲伪造（无密钥，MAC 随机）与密钥泄露（持有效 key，
+  // 密码层不可检出 → 漏检）。原实现仅一个自报布尔。
+  void SetForged(bool f, bool compromised){ m_forged = f; m_compromised = compromised; }
+  // 终端初始化凭证（合法终端与密钥泄露型伪造终端持有效 dev_key）
+  void InitCredential(const uint8_t root[32]){
+    deriveDevKey(root, m_termIdx, m_devKey);
+    uint8_t ps[4]; makePseudo(root, m_termIdx, ps);
+    m_pseudo = readBE32(ps);
+  }
 
   // 被链路调度调用的接收
   void Receive(Ptr<Packet> pkt, uint32_t srcId){
@@ -227,12 +463,12 @@ public:
   }
 
   // 接入失败：写 fail 事件（无服务星 -1 / 无有效时延 -1），终止该终端后续尝试
-  void TermFail(){
+  void TermFail(const char* authResult = "none"){
     double t = Simulator::Now().GetSeconds();
     g_trace << "ACCESS," << m_termIdx << "," << m_tag << "," << std::fixed
             << std::setprecision(3) << t << ",-1,-1,"
             << std::setprecision(2) << -1.0 << ",0.0,0.0,fail,0,0,0,"
-            << (m_forged?1:0) << "\n";
+            << (m_forged?1:0) << "," << authResult << ",0.0\n";
     m_accessed = true;
   }
 
@@ -252,35 +488,63 @@ public:
       double el = elevationDeg(g_termPos[m_nodeId], satPosAt(sid, t));
       if (el > bestEl){ bestEl = el; best = sid; }
     }
-    // 碰撞/拥塞限流（与 Python 轨同参）：星上按 (卫星, 10ms 时间片) 限流；
-    // 伪造终端不占信道（星上直接拦截，同 Python 轨“dev_sig 校验失败→不占信道”）
-    if (!m_forged && g_collisionOn){
+    // 碰撞/拥塞限流（与 Python 轨同参）：星上按 (卫星, 10ms 时间片) 限流。
+    // ★审计修复★：伪造终端同样占信道（星上须先接收再校验拒绝），与真实系统一致；
+    // 原实现「伪造不占信道」高估了系统抗伪造风暴能力。
+    // ★生存优先★：优先级感知 RACH 容量判定（镜像 Python protocol._slot_ok）
+    if (g_collisionOn && !slotOk(best, t, m_prio)){
+      if (m_retryCnt >= g_retryMax){      // 重试超限 → 接入失败
+        g_dbg_collision_fail++;
+        TermFail("collision_fail");
+        return;
+      }
+      m_retryCnt++;
+      double backoff = g_u01(g_runRng) * g_retryIntervalMs / 1000.0
+                       * prioBackoffScale(m_prio); // 高优退避更短（同 Python PRIO_BACKOFF）
+      Simulator::Schedule(Seconds(backoff), &LeoApp::AttemptAccess, this);
+      return;
+    }
+    // ---- ★审计修复★：四步 RACH 前导竞争（机理化，原为常量附加时延）----
+    // 同 (sat, 时隙, 前导) 被多终端选中 → msg3 竞争解决失败 → 退避重来。
+    if (g_rachSteps >= 4){
       uint32_t slot10 = (uint32_t)(t / 0.01);
-      auto key = std::make_pair(best, slot10);
-      uint32_t used = g_slotLoad.count(key) ? g_slotLoad[key] : 0;
-      if (used >= g_rachCapacity){
-        if (m_retryCnt >= g_retryMax){      // 重试超限 → 接入失败
-          g_dbg_collision_fail++;
-          TermFail();
+      uint32_t pre = g_runRng() % g_nPreamble;
+      auto pkey = std::make_tuple(best, slot10, pre);
+      auto pit = g_preambleUse.find(pkey);
+      if (pit != g_preambleUse.end() && pit->second != m_termIdx){
+        if (m_retryCnt >= (uint32_t)g_retryMax){
+          TermFail("contention_fail");
           return;
         }
         m_retryCnt++;
-        double backoff = g_u01(g_runRng) * g_retryIntervalMs / 1000.0; // 均匀退避（同 Python）
+        double backoff = g_u01(g_runRng) * g_retryIntervalMs / 1000.0
+                         * prioBackoffScale(m_prio);
         Simulator::Schedule(Seconds(backoff), &LeoApp::AttemptAccess, this);
         return;
       }
-      g_slotLoad[key] = used + 1;            // 受理（占用该时隙容量）
+      g_preambleUse[pkey] = m_termIdx;
     }
     m_servingSat = best;
     double rg = rangeKm(g_termPos[m_nodeId], satPosAt(best, t));
     double delay = rg / C_KM_S;
     g_dbg_req++;
-    // 两步接入：终端发 REQ（携带 GNSS 估计的 TA/多普勒/伪造标记/RACH 模式），卫星回 GRANT
+    // 两步接入：终端发 REQ（携带 GNSS 估计的 TA/多普勒/RACH 模式与 T4 凭证），卫星回 GRANT
     LeoHeader req; req.msgType=1; req.termId=m_termIdx; req.satId=best; req.seq=++m_seq;
     req.dopplerHz = dopplerHz(best, g_termPos[m_nodeId], t);
     req.taSec = 2.0 * delay; // 开环预补偿
-    req.forged = m_forged ? 1 : 0;
     req.steps = (uint8_t)g_rachSteps;
+    // ---- T4 凭证（★审计修复★：真实签名，替代自报比特）----
+    req.pseudoId = m_pseudo;
+    req.counter  = m_retryCnt + 1;
+    req.mac = m_compromised
+              ? signCred(m_devKey, m_pseudo, req.counter)      // 密钥泄露型：合法签名
+              : (m_forged
+                 ? (uint32_t)(g_runRng() >> 32)                // 盲伪造：随机 MAC
+                 : signCred(m_devKey, m_pseudo, req.counter)); // 合法终端：真实签名
+    // ---- 合法终端：链路误码可能破坏 MAC → 星上误拒（虚警率来源）----
+    if (!m_forged && macFailProb(rg) > g_u01(g_runRng)){
+      req.mac ^= (uint32_t(1) << (g_runRng() % 32));           // 翻转一个比特
+    }
     Ptr<Packet> p = Create<Packet>(); p->AddHeader(req);
     g_channel->Tx(m_nodeId, best, p, delay);
   }
@@ -304,7 +568,7 @@ public:
           if (el>be){ be=el; best=s; bestLos=std::get<2>(v); }
         }
         // 应急重连：候选此刻可见 → 可连时刻即 t；决策时刻亦为 t（缺口 = max(0, t − 旧LOS)）
-        DoHandover(best, t, t, bestLos, t);
+        DoHandover(best, t, t, m_servingLos, bestLos, t);
       }
       Simulator::Schedule(Seconds(g_tickS), &LeoApp::Tick, this);
       return;
@@ -320,22 +584,42 @@ public:
   }
 
   // 与 Python 轨 sim/protocol.py 逐条同规则的候选选择与切换（失配/乒乓/中断口径一致）
+  // ★审计修复★：联合打分 score = w_el·el_norm + w_dwell·dwell_norm（与 Python 轨一致）。
+  // 原实现 argmax(los) 系统性选中最低仰角星（仰角代价 26°）。
+  double hoScore(uint32_t satId, double at){
+    double el = elevationDeg(g_termPos[m_nodeId], satPosAt(satId, at));
+    double elNorm = std::max(0.0, std::min(1.0, (el - g_maskDeg) / (90.0 - g_maskDeg)));
+    auto it = g_termWins.find(m_nodeId);
+    double los = -1;
+    if (it != g_termWins.end()){
+      for (const auto& w : it->second)
+        if (w.satId == satId && w.aos <= at && at <= w.los){ los = w.los; break; }
+    }
+    double dw = (los > 0) ? std::max(0.0, std::min(1.0, (los - at) / 600.0)) : 0.0;
+    return g_wEl * elNorm + g_wDwell * dw;
+  }
+
   void PredictAndHandover(double t){
-    double tLos = m_servingLos;
-    // 决策时刻（同 Python: t_ho = max(LOS − ho_lead, 连接建立时刻)）
+    double tLosTrue = m_servingLos;
+    // ★审计修复★：星历预测误差（TLE 老化 → LOS 估计偏差，零均值高斯）。
+    // 原实现用完美未来窗口，预测永不失败 → 中断恒为 0（结构性恒等，非算法成果）。
+    double tLos = tLosTrue;
+    if (g_ephemErrS > 0){
+      std::normal_distribution<double> nd(0.0, g_ephemErrS);
+      tLos += nd(g_runRng);
+    }
+    // 决策时刻（同 Python: t_ho = max(预测LOS − ho_lead, 连接建立时刻)）
     double tHo = std::max(tLos - g_hoLeadS, m_accessFinT);
-    // 候选 A：LOS 时刻仍可见的非服务星（重叠覆盖，先建后断，中断≈0）
-    uint32_t cand = 0; double candLos = -1;
+    // 候选 A：预测 LOS 时刻仍可见的非服务星（重叠覆盖，先建后断）
+    uint32_t cand = 0; double candScore = -1e9, candLos = -1;
     auto visLos = visibleAt(m_nodeId, tLos);
     auto itWin = g_termWins.find(m_nodeId);
     for (auto& v : visLos){
       uint32_t s = std::get<0>(v);
       if (s == m_servingSat) continue;
       double los = std::get<2>(v);
-      // 防御（同 Python）：候选 LOS 必须严格晚于服务星 LOS，否则为预测失败，不入选
+      // 防御（同 Python）：候选 LOS 必须严格晚于服务星预测 LOS
       if (los <= tLos + 1e-9) continue;
-      // 防御（同 Python overlap）：候选须在决策时刻已可见（aos ≤ tHo），
-      // 未升起星一律交候选 B（等升起）兜底，避免切到“未升起星”导致服务链掉落
       double aosOf = -1;
       if (itWin != g_termWins.end()){
         for (const auto& w : itWin->second){
@@ -343,11 +627,17 @@ public:
         }
       }
       if (aosOf < 0 || aosOf > tHo + 1e-9) continue;
-      if (los > candLos){ candLos = los; cand = s; }   // 驻留最长（稳定优先，抑制乒乓）
+      double sc = hoScore(s, tHo);
+      if (sc > candScore){ candScore = sc; candLos = los; cand = s; }  // 联合打分最优
     }
     if (cand != 0){
-      // 重叠候选在 LOS 时刻已可见 → 可连时刻即 LOS（先建后断）
-      DoHandover(cand, t, tLos, candLos, tHo);
+      // ★迟滞★：新目标得分未超出当前服务星足够余量 → 不切换（抑制抖动/乒乓）
+      if (g_hoHyst > 0){
+        double curScore = hoScore(m_servingSat, tHo);
+        if (candScore < curScore + g_hoHyst) return;
+      }
+      // 重叠候选在预测 LOS 时刻已可见 → 可连时刻即预测 LOS（先建后断）
+      DoHandover(cand, t, tLos, tLosTrue, candLos, tHo);
       return;
     }
     // 候选 B：无重叠候选 → 最早升起星兜底（覆盖盲区，中断如实记录）
@@ -360,7 +650,7 @@ public:
       }
     }
     if (nid == 0) return;   // 全仿真无后续可见星，保持当前连接至结束
-    DoHandover(nid, t, naos, nlos, tLos);
+    DoHandover(nid, t, naos, tLosTrue, nlos, tLos);
   }
 
 private:
@@ -370,41 +660,67 @@ private:
   uint32_t m_termIdx;
   uint32_t m_satIdx;
   std::string m_tag;
+  uint32_t m_prio;     // 生存优先级（0=high,1=med,2=low）
   double m_burstT;
   bool m_accessed;
-  bool m_forged;          // T4：伪造终端标记（星上 dev_sig 校验失败 → 拦截）
+  bool m_forged;          // T4：伪造终端标记（抽样标签，仅用于 trace 分流与指标统计）
+  bool m_compromised;     // ★审计修复★：密钥泄露型伪造（持有效 dev_key，密码层不可检出）
+  uint8_t m_devKey[32];   // 终端派生密钥（合法终端与泄露型伪造持有效密钥）
+  uint32_t m_pseudo;      // 假名标识
   uint32_t m_retryCnt;    // 碰撞退避重试计数（超 g_retryMax 判失败）
   uint32_t m_servingSat;
   double m_servingLos;
   double m_accessFinT;    // 本段连接建立完成时刻（GRANT 收到时）——用于决策时刻下界
   uint16_t m_seq;
+  // ★审计修复★：乒乓重定义所需历史 [(satId, 切换时刻)]
+  std::vector<std::pair<uint32_t,double>> m_hoHist;
 
-  void DoHandover(uint32_t cand, double t, double candConnect, double candLos, double tHo){
+  // ★签名变更（审计修复）★：新增 losTrue（真实 LOS，区别于预测 LOS），用于中断计算。
+  void DoHandover(uint32_t cand, double t, double candConnect, double losTrue,
+                  double candLos, double tHo){
     double rg = rangeKm(g_termPos[m_nodeId], satPosAt(cand, t));
     double delay = rg / C_KM_S;
     // 预测失配（契约 2.1，与 Python 轨一致）：决策选中的候选 vs 执行时刻（服务星 LOS）
     // 仰角最优可见星：
-    auto visLos = visibleAt(m_nodeId, m_servingLos);
+    auto visLos = visibleAt(m_nodeId, losTrue);
     uint32_t bestEL = 0; double be = -1e9;
     for (auto& v : visLos){
       uint32_t s = std::get<0>(v);
       if (s == m_servingSat) continue;
-      double el = elevationDeg(g_termPos[m_nodeId], satPosAt(s, m_servingLos));
+      double el = elevationDeg(g_termPos[m_nodeId], satPosAt(s, losTrue));
       if (el > be){ be = el; bestEL = s; }
     }
     bool mismatch = (bestEL != 0) && (bestEL != cand);
     // 仰角代价（契约 2.1，与 Python 轨 ho_el_cost_deg 同口径）：仰角最优 − 选中星，@LOS 时刻
     double elCost = 0.0;
     if (bestEL != 0){
-      elCost = be - elevationDeg(g_termPos[m_nodeId], satPosAt(cand, m_servingLos));
+      elCost = be - elevationDeg(g_termPos[m_nodeId], satPosAt(cand, losTrue));
       if (elCost < 0) elCost = 0.0;
     }
-    // 乒乓（契约 2.1）：候选在决策时刻剩余可见 < 60s
-    bool pingpong = (candLos - tHo) < 60.0;
-    // 中断（契约 2.1）：业务间隙 = max(0, 新链可用 − 旧链丢失)，先建后断 → 通常 0
-    double confirmT = t + 2.0*delay + g_accessProcMs/1000.0;
+    // ★审计修复★：乒乓重定义（原判据与选优规则自相矛盾，恒为 0，不可证伪）：
+    //   1) 窗口内切回曾服务过的星；2) 相邻两次切换间隔 < 阈值
+    bool pingpong = false;
+    for (auto& hp : m_hoHist){
+      if (hp.first == cand && (tHo - hp.second) <= 60.0) pingpong = true;
+    }
+    if (!m_hoHist.empty() && (tHo - m_hoHist.back().second) < 30.0) pingpong = true;
+    m_hoHist.push_back({cand, tHo});
+    // 中断（契约 2.1）：业务间隙 = max(0, 新链可用 − 旧链真实丢失)
+    // ★审计修复★：原 avail = max(candConnect, t+2d+proc) 在 ho_lead>12ms 时恒 ≤ LOS，
+    // 属结构性恒等而非算法成果。现中断相对**真实** LOS 计算（预测高估 → 中断>0）。
+    double execS = 2.0*delay + g_accessProcMs/1000.0 + g_authExtraMs/1000.0;
+    double confirmT = tHo + execS;
     double avail = std::max(candConnect, confirmT);
-    double interrupt_ms = std::max(0.0, avail - m_servingLos) * 1000.0;
+    double interrupt_ms = std::max(0.0, avail - losTrue) * 1000.0;
+    // ---- T7 重连确认（★审计修复★：原无条件 success，无任何失败路径）----
+    // 目标星一次比对令牌：低仰角 → BER 高 → 令牌误码 → 确认失败 → 重传产生额外中断。
+    // 这使「仰角代价」兑现为真实后果（原为记账数字）。
+    const char* hoResult = "success";
+    if (macFailProb(rg) > g_u01(g_runRng)){
+      hoResult = "confirm_fail";
+      g_dbg_confirm_fail++;
+      interrupt_ms += execS * 1000.0;
+    }
     // 先建后断：PREP 提前发出
     LeoHeader prep; prep.msgType=3; prep.termId=m_termIdx; prep.satId=cand; prep.seq=++m_seq;
     prep.dopplerHz = dopplerHz(cand, g_termPos[m_nodeId], t); prep.taSec = 2.0*delay;
@@ -415,9 +731,10 @@ private:
             << std::setprecision(3) << tHo << "," << m_servingSat << "," << cand << ","
             << std::setprecision(2) << interrupt_ms << ","
             << std::setprecision(1) << std::abs(dopplerHz(cand, g_termPos[m_nodeId], t)) << ","
-            << std::setprecision(3) << rg << ",success,"
+            << std::setprecision(3) << rg << "," << hoResult << ","
             << (mismatch?1:0) << "," << (pingpong?1:0) << ","
-            << std::setprecision(2) << elCost << ",0\n";
+            << std::setprecision(2) << elCost << ",0,none,"
+            << std::setprecision(2) << (g_linkModelOn ? ebnoDb(rg) : 0.0) << "\n";
     m_servingSat = cand;
     m_servingLos = candLos;
   }
@@ -430,18 +747,33 @@ private:
       double delay_ms = (t - m_burstT) * 1000.0;
       if (delay_ms < 0) delay_ms = 0;   // 防御：不可见的时钟负差
       double rg = rangeKm(g_termPos[m_nodeId], satPosAt(h.satId, t));
+      // ★漏检语义★：密钥泄露型伪造终端通过校验 → 从网络看是成功接入（forged=1,
+      // auth_result=ok_missed）；接入成功率仅统计合法终端（forged=0），互不污染。
+      const char* authRes = (m_forged && m_compromised) ? "ok_missed" : "ok";
+      if (m_forged && m_compromised) g_dbg_forged_missed++;
       g_trace << "ACCESS," << m_termIdx << "," << m_tag << "," << std::fixed
               << std::setprecision(3) << t << "," << h.satId << "," << h.satId << ","
               << std::setprecision(2) << delay_ms << ","
               << std::setprecision(1) << std::abs(h.dopplerHz) << ","
-              << std::setprecision(3) << rg << ",success,0,0,0,0\n";
+              << std::setprecision(3) << rg << ",success,0,0,0,"
+              << (m_forged?1:0) << "," << authRes << ","
+              << std::setprecision(2) << (g_linkModelOn ? ebnoDb(rg) : 0.0) << "\n";
       m_accessed = true;
       m_accessFinT = t;
       Simulator::Schedule(Seconds(g_tickS), &LeoApp::Tick, this);
     } else if (h.msgType == 4){ // HO_CONFIRM
       // 中断已在 DoHandover 决策时记录；此处仅确认（无需重复写）
-    } else if (h.msgType == 5){ // ACCESS_DENY：伪造终端被拦截（不进入接入流程）
-      TermFail();
+    } else if (h.msgType == 5){ // ACCESS_DENY：校验失败（伪造拦截或误码虚警）
+      // ★审计修复★：合法终端被误拒允许退避重试（虚警有恢复路径），重试超限才判失败
+      if (!m_forged && m_retryCnt < (uint32_t)g_retryMax){
+        m_retryCnt++;
+        double backoff = g_u01(g_runRng) * g_retryIntervalMs / 1000.0
+                         * prioBackoffScale(m_prio);
+        m_accessed = false;
+        Simulator::Schedule(Seconds(backoff), &LeoApp::AttemptAccess, this);
+        return;
+      }
+      TermFail(m_forged ? "bad_mac" : "false_reject");
     }
   }
 
@@ -450,13 +782,28 @@ private:
     if (h.msgType == 1){ // ACCESS_REQ
       // 星上处理时序（与 Python 轨 access_delay = 2×传播 + 星上处理 + 认证/四步附加 同参）
       double authWait  = g_authExtraMs / 1000.0;                       // 轻量凭证校验
-      double rachWait  = authWait + (g_rachSteps >= 4 ? g_step4ExtraMs / 1000.0 : 0.0); // 四步附加
       double rg = rangeKm(g_termPos[srcId], satPosAt(m_nodeId, t));
       double delay = rg / C_KM_S;
-      if (h.forged){ // T4：dev_sig 校验失败 → 拒绝（不进入两步/四步流程，不占 RACH 容量）
+      // 四步附加时延（★审计修复★：机理化——由斜距实算 + 具名定时器，原为常量 400ms）
+      double step4Wait = (g_rachSteps >= 4) ? step4ExtraMsCalc(delay*1000.0)/1000.0 : 0.0;
+      // ---- T4：真实 HMAC-SHA256 校验（★审计修复★：原为读自报 forged 比特）----
+      uint8_t root[32]; deriveRootKey(root);
+      uint8_t dk[32]; deriveDevKey(root, h.termId, dk);
+      char res = verifyOnboard(dk, h.pseudoId, h.counter, h.mac);
+      if (res == 'm'){
+        // MAC 校验失败：盲伪造（拦截）或合法终端被信道误码误拒（虚警）
+        // 由 trace 的 forged 列分流统计，此处统一回 DENY。
         g_dbg_forged_blocked++;
         LeoHeader deny; deny.msgType=5; deny.termId=h.termId; deny.satId=m_nodeId;
-        deny.seq=h.seq; deny.forged=1;
+        deny.seq=h.seq;
+        Ptr<Packet> p = Create<Packet>(); p->AddHeader(deny);
+        Simulator::Schedule(Seconds(authWait), &LeoChannel::Tx, g_channel, m_nodeId, srcId, p, delay);
+        return;
+      }
+      if (res == 'r'){  // 重放 → 拦截
+        g_dbg_forged_blocked++;
+        LeoHeader deny; deny.msgType=5; deny.termId=h.termId; deny.satId=m_nodeId;
+        deny.seq=h.seq;
         Ptr<Packet> p = Create<Packet>(); p->AddHeader(deny);
         Simulator::Schedule(Seconds(authWait), &LeoChannel::Tx, g_channel, m_nodeId, srcId, p, delay);
         return;
@@ -466,7 +813,7 @@ private:
       grant.seq=h.seq; grant.dopplerHz = dopplerHz(m_nodeId, g_termPos[srcId], t);
       grant.taSec = 2.0*delay; grant.steps = h.steps;
       Ptr<Packet> p = Create<Packet>(); p->AddHeader(grant);
-      Simulator::Schedule(Seconds(g_accessProcMs/1000.0 + rachWait),
+      Simulator::Schedule(Seconds(g_accessProcMs/1000.0 + authWait + step4Wait),
                           &LeoChannel::Tx, g_channel, m_nodeId, srcId, p, delay);
     } else if (h.msgType == 3){ // HO_PREP -> CONFIRM
       double rg = rangeKm(g_termPos[srcId], satPosAt(m_nodeId, t));
@@ -576,10 +923,17 @@ int main(int argc, char* argv[]){
   std::string outdir = ".";
   double maskDeg=25, simDur=3600, stepS=15, burstStart=5, burstWin=60;
   double hoLead=20, tickS=1, carrierHz=2.0e9, accessProcMs=3;
-  double authExtraMs=0, step4ExtraMs=400, forgedRatio=0;
+  double authExtraMs=0, forgedRatio=0;
   double retryIntervalMs=500;
   uint32_t rachSteps=2, rachCapacity=64, retryMax=20, nTerms=80;
   int32_t collisionOn=0;
+  int32_t priorityOn=1;   // ★生存优先★ default true（同 Python scenario.priority_on 默认）
+  // ---- ★审计修复 2026-09-02：新增机理参数（与 sim/config.py 同参）----
+  double ephemErrS=0, wEl=0.5, wDwell=0.5, hoHyst=0, compromisedShare=0.15;
+  double eirpDbm=68, gtDbiK=-20, bitRateBps=100e3;
+  uint32_t rarWindowMs=160, contTimerMs=200, nPreamble=64;
+  int32_t linkModelOn=1;
+  uint64_t rngSeed=20260901;   // ★原固定 12345，现可配置（多种子/置信区间实验）★
 
   CommandLine cmd;
   cmd.AddValue("indir", "输入目录", indir);
@@ -596,30 +950,60 @@ int main(int argc, char* argv[]){
   cmd.AddValue("nTerms", "终端数", nTerms);
   // T4 / RACH / 碰撞（与 Python 轨 scenario.py 同参）
   cmd.AddValue("forgedRatio", "伪造终端占比", forgedRatio);
+  cmd.AddValue("compromisedShare", "伪造中持有效密钥比例(漏检率)", compromisedShare);
   cmd.AddValue("authExtraMs", "认证附加时延(ms)", authExtraMs);
   cmd.AddValue("rachSteps", "RACH 模式(2=两步 4=四步)", rachSteps);
-  cmd.AddValue("step4ExtraMs", "四步附加时延(ms)", step4ExtraMs);
   cmd.AddValue("collisionOn", "碰撞/拥塞模型开关", collisionOn);
+  cmd.AddValue("priorityOn", "生存优先分级调度开关", priorityOn);
   cmd.AddValue("rachCapacity", "每10ms时隙受理上限", rachCapacity);
+  double prioResHigh = 0.5, prioResMed = 0.3, prioResLow = 0.2;
+  cmd.AddValue("prioResHigh", "high 专用预留比例", prioResHigh);
+  cmd.AddValue("prioResMed", "med 专用预留比例", prioResMed);
+  cmd.AddValue("prioResLow", "low 专用预留比例", prioResLow);
   cmd.AddValue("retryIntervalMs", "退避间隔上限(ms)", retryIntervalMs);
   cmd.AddValue("retryMax", "碰撞重试上限", retryMax);
+  // ★审计修复：机理参数★
+  cmd.AddValue("ephemErrS", "星历预测误差σ(s)", ephemErrS);
+  cmd.AddValue("wEl", "选星仰角权重", wEl);
+  cmd.AddValue("wDwell", "选星驻留权重", wDwell);
+  cmd.AddValue("hoHyst", "切换迟滞(score单位)", hoHyst);
+  cmd.AddValue("rarWindowMs", "四步RAR响应窗口(ms)", rarWindowMs);
+  cmd.AddValue("contTimerMs", "四步竞争解决定时器(ms)", contTimerMs);
+  cmd.AddValue("nPreamble", "前导码数量", nPreamble);
+  cmd.AddValue("eirpDbm", "卫星EIRP(dBm)", eirpDbm);
+  cmd.AddValue("gtDbiK", "终端G/T(dB/K)", gtDbiK);
+  cmd.AddValue("bitRateBps", "业务速率(bps)", bitRateBps);
+  cmd.AddValue("linkModelOn", "链路模型开关", linkModelOn);
+  cmd.AddValue("rngSeed", "随机种子", rngSeed);
   cmd.Parse(argc, argv);
 
   g_maskDeg = maskDeg; g_carrierHz = carrierHz; g_hoLeadS = hoLead;
   g_tickS = tickS; g_accessProcMs = accessProcMs; g_simDur = simDur;
-  g_authExtraMs = authExtraMs; g_step4ExtraMs = step4ExtraMs;
+  g_authExtraMs = authExtraMs;
   g_rachSteps = rachSteps; g_forgedRatio = forgedRatio;
+  g_compromisedShare = compromisedShare;
   g_collisionOn = (collisionOn != 0); g_rachCapacity = rachCapacity;
+  g_priorityOn = (priorityOn != 0);
+  g_prioReserveFrac[0] = prioResHigh; g_prioReserveFrac[1] = prioResMed; g_prioReserveFrac[2] = prioResLow;
   g_retryIntervalMs = retryIntervalMs; g_retryMax = retryMax;
+  g_ephemErrS = ephemErrS; g_wEl = wEl; g_wDwell = wDwell; g_hoHyst = hoHyst;
+  g_rarWindowMs = rarWindowMs; g_contTimerMs = contTimerMs; g_nPreamble = nPreamble;
+  g_eirpDbm = eirpDbm; g_gtDbiK = gtDbiK; g_bitRateBps = bitRateBps;
+  g_linkModelOn = (linkModelOn != 0); g_rngSeed = rngSeed;
+  g_runRng.seed((uint32_t)rngSeed);
 
   std::cout << "[LeoAccess] ns-3 离散事件接入/切换仿真启动" << std::endl;
   std::cout << "  输入目录=" << indir << " 输出目录=" << outdir << std::endl;
   std::cout << "  掩角=" << maskDeg << "° 时长=" << simDur << "s 步长=" << stepS
             << "s 突发=[" << burstStart << "," << burstStart+burstWin << "]s" << std::endl;
   std::cout << "  两步/四步=" << rachSteps << " 伪造占比=" << forgedRatio
-            << " 认证附加=" << authExtraMs << "ms 四步附加=" << step4ExtraMs << "ms" << std::endl;
+            << " 密钥泄露占比=" << compromisedShare
+            << " 认证附加=" << authExtraMs << "ms" << std::endl;
   std::cout << "  碰撞开关=" << collisionOn << " 容量=" << rachCapacity
             << "/10ms 退避=" << retryIntervalMs << "ms 重试上限=" << retryMax << std::endl;
+  std::cout << "  星历误差σ=" << ephemErrS << "s 选星权重 wEl=" << wEl
+            << " 迟滞=" << hoHyst << " 种子=" << rngSeed
+            << " 生存优先=" << (priorityOn ? "开" : "关") << std::endl;
 
   // 读终端
   std::map<uint32_t, Ecef> termPosTmp;
@@ -714,7 +1098,9 @@ int main(int argc, char* argv[]){
   precomputeWindows();
 
   // 安装应用
-  std::mt19937 rng(12345);
+  // ★审计修复★：到达时刻 RNG 由 rngSeed 派生（原固定 12345，无法做多种子实验）
+  std::mt19937 rng((uint32_t)(rngSeed ^ 0x9E3779B97F4A7C15ULL));
+  uint8_t rootKey[32]; deriveRootKey(rootKey);
   for (uint32_t i=0; i<nSats; ++i){
     Ptr<LeoApp> app = CreateObject<LeoApp>();
     app->SetSatellite(i);
@@ -728,7 +1114,11 @@ int main(int argc, char* argv[]){
     double burstT = burstStart + u(rng)*burstWin;
     Ptr<LeoApp> app = CreateObject<LeoApp>();
     app->SetTerminal(i, termTag[i], burstT);
-    app->SetForged(g_forgedRatio > 0 && u(rng) < g_forgedRatio); // T4：按占比抽样伪造终端
+    // ★审计修复★：伪造终端分「盲伪造 / 密钥泄露」两类（后者密码层不可检出 → 漏检率）
+    bool isForged = (g_forgedRatio > 0 && u(rng) < g_forgedRatio);
+    bool isCompromised = isForged && (u(rng) < g_compromisedShare);
+    app->SetForged(isForged, isCompromised);
+    app->InitCredential(rootKey);   // 所有终端初始化派生密钥与假名
     n->AddApplication(app);
     app->SetStartTime(Seconds(0));
     app->SetStopTime(Seconds(simDur));
@@ -736,7 +1126,9 @@ int main(int argc, char* argv[]){
 
   // 打开 trace
   g_trace.open(outdir + "/access_trace.csv");
-  g_trace << "event_type,terminal,tag,t_s,serving_sat,target_sat,value_ms,doppler_hz,slant_km,result,predict_mismatch,pingpong,ho_el_cost_deg,forged\n";
+  // ★契约 16 列（与 sim/interfaces.TRACE_COLS 严格一致）★
+  g_trace << "event_type,terminal,tag,t_s,serving_sat,target_sat,value_ms,doppler_hz,slant_km,"
+          << "result,predict_mismatch,pingpong,ho_el_cost_deg,forged,auth_result,ebno_db\n";
 
   std::cout << "  Simulator::Run() 开始（真实离散事件调度）..." << std::endl;
   auto t0 = std::chrono::high_resolution_clock::now();
@@ -751,6 +1143,8 @@ int main(int argc, char* argv[]){
   std::cout << "  [审计] ns-3 版本=ns-3-dev(3-dev) 模块=core/network/mobility(自定义LEO信道)"
             << " 卫星=" << nSats << " 终端=" << nTerms << std::endl;
   std::cout << "  [DBG] AttemptAccess调用=" << g_dbg_attempt << " REQ发送=" << g_dbg_req
-            << " 伪造拦截=" << g_dbg_forged_blocked << " 碰撞重试超限失败=" << g_dbg_collision_fail << std::endl;
+            << " 伪造拦截=" << g_dbg_forged_blocked << " 碰撞重试超限失败=" << g_dbg_collision_fail
+            << " 漏检(密钥泄露)=" << g_dbg_forged_missed
+            << " 确认失败=" << g_dbg_confirm_fail << std::endl;
   return 0;
 }

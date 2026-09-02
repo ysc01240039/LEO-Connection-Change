@@ -151,73 +151,30 @@ TRACE_FIELDS = ["event_type", "terminal", "tag", "t_s", "serving_sat",
 
 
 def parse_ns3_trace(out_csv):
-    rows = []
+    """解析 ns-3 trace。★审计修复★：增加表头校验，缺列立即报错而非静默取空。"""
     with open(out_csv, newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
-        for d in r:
+        if r.fieldnames is None:
+            raise ValueError(f"trace 文件为空或缺少表头: {out_csv}")
+        missing = [c for c in TRACE_FIELDS if c not in r.fieldnames]
+        if missing:
+            raise ValueError(
+                f"trace 缺少契约字段 {missing}\n  实际表头: {r.fieldnames}\n"
+                f"  期望: {TRACE_FIELDS}\n  → 请重新编译/运行 ns-3 侧 leo_access.cc")
+        rows = []
+        for i, d in enumerate(r, 1):
+            if not d.get("event_type"):
+                raise ValueError(f"trace 第 {i} 行缺少 event_type: {out_csv}")
             rows.append(d)
     return rows
 
 
-def compute_ns3_metrics(trace):
-    """trace: list[dict]，字段见 TRACE_FIELDS（与接口契约一致）。
-    口径（契约 2.1，与 Python 轨 sim/eval.compute_metrics 完全一致）：
-    - 接入成功率按合法终端统计；伪造终端由「伪造终端数/拦截率」单独汇报；
-    - 接入时延 = (GRANT 完成时刻 − 首次发起时刻)×1000（端到端，含退避/等待与握手），
-      仅统计成功接入的合法终端（value_ms > 0）。"""
-    acc = [e for e in trace if e["event_type"] == "ACCESS"]
-    ho = [e for e in trace if e["event_type"] == "HANDOVER"]
-    def f(x):
-        return float(x)
-    def metrics_of(acc_list):
-        if not acc_list:
-            return {}
-        dl = sorted(f(e["value_ms"]) for e in acc_list if f(e["value_ms"]) > 0)  # 失败事件不参与时延统计（口径同 eval.py）
-        n = len(acc_list)
-        succ = sum(1 for e in acc_list if e["result"] == "success")
-        if not dl:
-            return {"接入事件数": n, "接入成功率": round(succ / n, 4),
-                    "接入时延均值_ms": 0.0, "接入时延P95_ms": 0.0}
-        mean = sum(dl) / len(dl)
-        p95 = dl[min(len(dl) - 1, int(0.95 * len(dl)))]
-        return {
-            "接入事件数": n,
-            "接入成功率": round(succ / n, 4),
-            "接入时延均值_ms": round(mean, 2),
-            "接入时延P95_ms": round(p95, 2),
-        }
-    # 合法终端与伪造终端分流（T4 口径，与 Python 轨 eval.py 同名同口径）
-    forged = [e for e in acc if e.get("forged", "0") == "1"]
-    legit = [e for e in acc if e.get("forged", "0") != "1"]
-    acc_m = metrics_of(legit)
-    ho_metrics = {}
-    if ho:
-        inter = sorted(f(e["value_ms"]) for e in ho)
-        n = len(inter)
-        elc = [f(e.get("ho_el_cost_deg", 0) or 0) for e in ho]
-        ho_metrics = {
-            "切换事件数": n,
-            "切换中断均值_ms": round(sum(inter) / n, 2),
-            "切换中断最大_ms": round(max(inter), 2),
-            "乒乓切换率": round(sum(1 for e in ho if e["pingpong"] == "1") / n, 4),
-            "预测失配率": round(sum(1 for e in ho if e["predict_mismatch"] == "1") / n, 4),
-            "仰角代价均值_deg": round(sum(elc) / n, 2),
-            "仰角代价最大_deg": round(max(elc), 2),
-        }
-    # T4 认证指标（伪造终端拦截，与 Python 轨 sim/eval.compute_metrics 同名同口径）
-    if forged:
-        acc_m["伪造终端数"] = len(forged)
-        acc_m["伪造终端拦截率"] = round(
-            sum(1 for e in forged if e["result"] == "fail") / len(forged), 4)
-    # 多普勒（取所有事件最大绝对值，反映 LEO 多普勒量级）
-    dop = [abs(f(e["doppler_hz"])) for e in trace if e["doppler_hz"] not in ("", None)]
-    dop_max = round(max(dop), 1) if dop else 0.0
-    merged = {}
-    merged.update(acc_m)
-    merged.update(ho_metrics)
-    merged["多普勒最大值_Hz"] = dop_max
-    merged["总事件数"] = len(trace)
-    return merged
+def compute_ns3_metrics(trace, summary=None):
+    """★审计修复★：原为与 sim/eval.compute_metrics 近乎逐行的重复实现（约 55 行），
+    两侧靠注释维系「同名同口径」，实际已出现不一致（C++ 对 elCost 做 <0→0 截断，
+    Python 未做）。现统一委托给 eval.compute_metrics（类型宽容），消除漂移。"""
+    from .eval import compute_metrics
+    return compute_metrics(trace, summary)
 
 
 if __name__ == "__main__":

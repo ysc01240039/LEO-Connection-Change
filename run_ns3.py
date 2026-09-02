@@ -2,20 +2,35 @@
 
 用法（受管 venv python，工作区根目录）：
   python run_ns3.py                # 默认 汶川 + OneWeb
-  python run_ns3.py henan starlink
+  python run_ns3.py henan oneweb --seed 42
+  python run_ns3.py wenchuan oneweb --ephem-err 30 --ho-lead 5   # 敏感性分析
+
+★ 审计修复（2026-09-02）★
+1. **fail-fast**：原实现 WSL 调用失败仅打印 [WARN] 后**继续读取磁盘上的旧 trace**，
+   把陈旧数据当新结果出报告（退出码 0，无任何标识）。现改为直接抛错终止。
+2. **种子参数化**：原 ns-3 侧随机种子固定（mt19937(12345)），无法做多种子/置信区间
+   实验。现支持 --seed 传入。
+3. **机理参数透传**：星历误差 / 选星权重 / 迟滞 / 密钥泄露占比 / 链路参数等
+   与 Python 轨同参透传，保证双轨可比。
+4. **产物隔离**：结果落在 data/sim/runs/<场景>_<种子>_<时间戳>_ns3/，不再覆盖。
 """
-import sys
-import json
 import subprocess
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sim.config import (DATA_DIR, MASK_ANGLE_DEG, SIM_DURATION_S, TIME_STEP_S,
-                        HO_LEAD_S, TICK_S, CARRIER_FREQ_HZ)
+                        HO_LEAD_S, TICK_S, CARRIER_FREQ_HZ, EPHEM_ERR_S,
+                        HO_W_EL, HO_W_DWELL, EIRP_DBM, GT_DBI_K, BIT_RATE_BPS,
+                        RAR_WINDOW_MS, CONTENTION_TIMER_MS, N_PREAMBLE,
+                        ACCESS_PROC_MS, AUTH_CPU_DERATE, PRIORITY_RESERVE_FRAC)
 from sim.scenario import get_scenario
 from sim.data_sources import fetch_tle
 from sim.orbit import build_timescale
 from sim import ns3_io
-from sim.viz import plot_coverage_timeline, plot_handover, write_report_ns3
+from sim import auth as _auth
+from sim.eval import compute_metrics
+from sim.viz import plot_coverage_timeline, plot_handover
 
 
 def win2wsl(p: str) -> str:
@@ -25,108 +40,144 @@ def win2wsl(p: str) -> str:
     return p
 
 
-def main(scenario_key: str = "wenchuan", group: str = "oneweb"):
+def parse_args(argv):
+    args = {"seed": 20260901, "no_viz": False, "ephem_err": None,
+            "ho_lead": None, "w_el": None, "w_dwell": None, "hyst": None,
+            "compromised": None}
+    pos, i = [], 0
+    while i < len(argv):
+        a, nxt = argv[i], (argv[i + 1] if i + 1 < len(argv) else None)
+        if a == "--seed" and nxt:
+            args["seed"] = int(nxt); i += 2
+        elif a == "--ephem-err" and nxt:
+            args["ephem_err"] = float(nxt); i += 2
+        elif a == "--ho-lead" and nxt:
+            args["ho_lead"] = float(nxt); i += 2
+        elif a == "--w-el" and nxt:
+            args["w_el"] = float(nxt); i += 2
+        elif a == "--w-dwell" and nxt:
+            args["w_dwell"] = float(nxt); i += 2
+        elif a == "--hyst" and nxt:
+            args["hyst"] = float(nxt); i += 2
+        elif a == "--compromised" and nxt:
+            args["compromised"] = float(nxt); i += 2
+        elif a == "--no-viz":
+            args["no_viz"] = True; i += 1
+        else:
+            pos.append(a); i += 1
+    return pos, args
+
+
+def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = False,
+         seed: int = 20260901, overrides=None):
+    ov = {k: v for k, v in (overrides or {}).items() if v is not None}
     print(f"[1/5] 生成真实输入（TLE -> ECEF 星历 + 终端分布）")
     sc = get_scenario(scenario_key)
     sats, prov = fetch_tle(group)
     ts = build_timescale()
     # 参数一律取自场景配置（双轨同源，避免硬编码漂移）
+    # ★双轨一致性修复★：CLI 覆盖优先，其次取场景级 ho_lead_s/ephem_err_s，
+    # 最后才是 config 默认。原实现直接取 config 默认，忽略场景级参数，
+    # 导致 rel17_baseline(ho_lead=0, ephem=5) 被 ns-3 跑成提案(ho_lead=20, ephem=0)，双轨不一致。
+    ho_lead = ov.get("ho_lead", sc.get("ho_lead_s", HO_LEAD_S))
+    ephem_err = ov.get("ephem_err", sc.get("ephem_err_s", EPHEM_ERR_S))
+    w_el = ov.get("w_el", HO_W_EL)
+    w_dwell = ov.get("w_dwell", HO_W_DWELL)
+    hyst = ov.get("hyst", sc.get("ho_hyst", 0.0))
+    compromised = ov.get("compromised", sc.get("compromised_share", 0.15))
+    auth_extra_ms = _auth.measure_verify_ms() * AUTH_CPU_DERATE
     params = dict(mask_deg=MASK_ANGLE_DEG, sim_duration_s=SIM_DURATION_S,
                   time_step_s=TIME_STEP_S,
                   burst_start_s=sc.get("burst_start_s", 5),
                   burst_window_s=sc.get("burst_ramp_s", 60),
                   access_proc_ms=sc.get("access_proc_ms", 3.0),
-                  ho_lead_s=HO_LEAD_S, tick_s=TICK_S, carrier_hz=CARRIER_FREQ_HZ)
-    ns3_io.gen_ephemeris(sats, ts, params["time_step_s"], params["sim_duration_s"], ns3_io.NS3_IN / "ephemeris.csv")
-    ns3_io.gen_terminals(sc, ns3_io.NS3_IN / "terminals.csv")
+                  ho_lead_s=ho_lead, tick_s=TICK_S, carrier_hz=CARRIER_FREQ_HZ)
+    ns3_io.gen_ephemeris(sats, ts, params["time_step_s"], params["sim_duration_s"],
+                         ns3_io.NS3_IN / "ephemeris.csv")
+    ns3_io.gen_terminals(sc, ns3_io.NS3_IN / "terminals.csv", seed=seed)
     ns3_io.write_ns3_scenario(sc, prov, params, ns3_io.NS3_IN / "scenario.json")
-    print(f"      卫星 {len(sats)} 颗 · 终端 {sc['terminals']} 个 · 星历已写")
+    print(f"      卫星 {len(sats)} 颗 · 终端 {sc['terminals']} 个 · 星历已写 · seed={seed}")
 
     print(f"[2/5] 调用 WSL 运行 ns-3 离散事件仿真 ...")
     indir = win2wsl(str(ns3_io.NS3_IN))
     outdir = win2wsl(str(ns3_io.NS3_OUT))
     inner = (
+        "if ! cmp -s /mnt/e/pytorchFile/NationalCreation1/.ns3_ref/leo_access.cc "
+        "/home/mark/ns-3-dev/scratch/leo_access.cc 2>/dev/null; then "
         "cp /mnt/e/pytorchFile/NationalCreation1/.ns3_ref/leo_access.cc "
-        "/home/mark/ns-3-dev/scratch/leo_access.cc; "
+        "/home/mark/ns-3-dev/scratch/leo_access.cc; fi; "
         "cd /home/mark/ns-3-dev && ./ns3 run \"leo_access "
         f"--indir={indir} --outdir={outdir} "
         f"--maskDeg={params['mask_deg']} --simDur={params['sim_duration_s']} "
         f"--stepS={params['time_step_s']} --burstStart={params['burst_start_s']} "
-        f"--burstWin={params['burst_window_s']} --hoLead={params['ho_lead_s']} "
+        f"--burstWin={params['burst_window_s']} --hoLead={ho_lead} "
         f"--tickS={params['tick_s']} --carrierHz={int(params['carrier_hz'])} "
         f"--accessProcMs={params['access_proc_ms']} --nTerms={sc['terminals']} "
-        f"--forgedRatio={sc.get('forged_ratio', 0)} --authExtraMs={sc.get('auth_extra_ms', 0)} "
-        f"--rachSteps={sc.get('rach_steps', 2)} --step4ExtraMs={sc.get('step4_extra_ms', 400)} "
+        f"--forgedRatio={sc.get('forged_ratio', 0)} --authExtraMs={auth_extra_ms:.6f} "
+        f"--rachSteps={sc.get('rach_steps', 2)} "
         f"--collisionOn={1 if sc.get('collision_on', False) else 0} "
+        f"--priorityOn={1 if sc.get('priority_on', True) else 0} "
+        f"--prioResHigh={PRIORITY_RESERVE_FRAC[0]} "
+        f"--prioResMed={PRIORITY_RESERVE_FRAC[1]} "
+        f"--prioResLow={PRIORITY_RESERVE_FRAC[2]} "
         f"--rachCapacity={sc.get('rach_capacity', 64)} "
         f"--retryIntervalMs={sc.get('retry_interval_ms', 500)} "
-        f"--retryMax={sc.get('retry_max', 20)}\""
+        f"--retryMax={sc.get('retry_max', 20)} "
+        f"--ephemErrS={ephem_err} --wEl={w_el} --wDwell={w_dwell} --hoHyst={hyst} "
+        f"--compromisedShare={compromised} --rngSeed={seed} "
+        f"--eirpDbm={EIRP_DBM} --gtDbiK={GT_DBI_K} --bitRateBps={BIT_RATE_BPS} "
+        f"--rarWindowMs={RAR_WINDOW_MS} --contTimerMs={CONTENTION_TIMER_MS} "
+        f"--nPreamble={N_PREAMBLE} --linkModelOn=1\""
     )
     run_cmd = f'wsl -d Ubuntu-24.04 -- bash -c "{inner}"'
+    # ★审计修复：fail-fast★ —— WSL/ns-3 失败必须终止，禁止静默使用旧 trace 冒充新结果
+    r = subprocess.run(["wsl", "-d", "Ubuntu-24.04", "--", "bash", "-c", inner],
+                       capture_output=True, text=True, timeout=600,
+                       encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"ns-3 运行失败（returncode={r.returncode}）。\n"
+            f"  stderr 尾部: {r.stderr[-500:] if r.stderr else '(空)'}\n"
+            f"  手动复现命令: {run_cmd}\n"
+            f"  ★已禁止读取旧 trace 冒充新结果（审计修复 2026-09-02）★")
     wall_s = None
-    try:
-        r = subprocess.run(["wsl", "-d", "Ubuntu-24.04", "--", "bash", "-c", inner],
-                           capture_output=True, text=True, timeout=600,
-                           encoding="utf-8", errors="replace")
-        out = r.stdout + r.stderr
-        for line in out.splitlines():
-            if "ns-3 调度墙钟时间=" in line:
-                wall_s = line.split("=")[-1].strip().rstrip("s")
-        print("      ns-3 输出尾部：")
-        for line in out.splitlines()[-8:]:
-            print("      " + line)
-    except Exception as e:
-        print(f"      [WARN] 自动调用 WSL 失败（{e}）；将使用已存在的 trace。可手动运行：\n      {run_cmd}")
+    out = r.stdout + r.stderr
+    for line in out.splitlines():
+        if "ns-3 调度墙钟时间=" in line:
+            wall_s = line.split("=")[-1].strip().rstrip("s")
+    for line in out.splitlines()[-6:]:
+        print("      " + line)
 
     print(f"[3/5] 解析 ns-3 真实 trace ...")
     trace = ns3_io.parse_ns3_trace(ns3_io.NS3_OUT / "access_trace.csv")
-    metrics = ns3_io.compute_ns3_metrics(trace)
-    print("      指标：" + json.dumps(metrics, ensure_ascii=False))
+    summary = {"auth_extra_ms": round(auth_extra_ms, 6)}
+    metrics = compute_metrics(trace, summary)
+    print("      指标：" + __import__("json").dumps(metrics, ensure_ascii=False))
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    rundir = DATA_DIR / "runs" / f"{scenario_key}_s{seed}_ns3_{stamp}"
+    rundir.mkdir(parents=True, exist_ok=True)
+    (rundir / "metrics.json").write_text(
+        __import__("json").dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+    (rundir / "access_trace.csv").write_bytes((ns3_io.NS3_OUT / "access_trace.csv").read_bytes())
+    print(f"      产物 -> {rundir}")
+
+    if no_viz:
+        return metrics, None, rundir
 
     print(f"[4/5] 生成中文图表 ...")
     cov = ns3_io.compute_coverage(ns3_io.NS3_IN / "ephemeris.csv", sc["lat"], sc["lon"],
                                   sc["alt_m"], params["mask_deg"], params["time_step_s"],
                                   int(params["sim_duration_s"] / params["time_step_s"]) + 1)
-    pc = plot_coverage_timeline(cov, params["time_step_s"], sc["name"])
-    ph = plot_handover(trace, sc["name"])
-
-    print(f"[5/5] 写专业报告 ...")
-    ns3_meta = {
-        "version": "ns-3-dev (3-dev)",
-        "modules": "core / network / mobility（自定义 LEO 信道）",
-        "n_sats": len(sats),
-        "n_terms": sc["terminals"],
-        "sim_duration_s": params["sim_duration_s"],
-        "mask_deg": params["mask_deg"],
-        "carrier_hz": int(params["carrier_hz"]),
-        "access_proc_ms": params["access_proc_ms"],
-        "ho_lead_s": params["ho_lead_s"],
-        "rach_steps": sc.get("rach_steps", 2),
-        "forged_ratio": sc.get("forged_ratio", 0),
-        "auth_extra_ms": sc.get("auth_extra_ms", 0),
-        "rach_capacity": sc.get("rach_capacity", 64),
-        "retry_max": sc.get("retry_max", 20),
-        "collision_on": sc.get("collision_on", False),
-        "wall_s": wall_s or "≈0.2",
-        "run_command": run_cmd,
-    }
-    # 事件样例（前 6 条 ACCESS + 前 6 条 HANDOVER）
-    acc = [e for e in trace if e["event_type"] == "ACCESS"][:6]
-    ho = [e for e in trace if e["event_type"] == "HANDOVER"][:6]
-    samples = [",".join(str(x) for x in e.values()) for e in acc + ho]
-    rep = write_report_ns3(metrics, prov, sc["name"], pc, ph,
-                           DATA_DIR / "report_ns3.html", ns3_meta, samples)
-
-    # 同时落盘 metrics.json（供 Web 消费，接口一致）
-    with open(DATA_DIR / "metrics_ns3.json", "w", encoding="utf-8") as f:
-        json.dump(metrics, f, ensure_ascii=False, indent=2)
-    print(f"产出：{rep}")
-    print(f"      指标：{DATA_DIR / 'metrics_ns3.json'}")
-    print(f"      图表：{pc.name}, {ph.name}")
-    return metrics, rep
+    pc = plot_coverage_timeline(cov, params["time_step_s"], sc["name"], outdir=rundir)
+    ph = plot_handover(trace, sc["name"], outdir=rundir)
+    print(f"[5/5] 图表: {pc.name}, {ph.name}")
+    return metrics, (pc, ph), rundir
 
 
 if __name__ == "__main__":
-    sk = sys.argv[1] if len(sys.argv) > 1 else "wenchuan"
-    gp = sys.argv[2] if len(sys.argv) > 2 else "oneweb"
-    main(sk, gp)
+    pos, args = parse_args([a for a in sys.argv[1:]])
+    sk = pos[0] if len(pos) > 0 else "wenchuan"
+    gp = pos[1] if len(pos) > 1 else "oneweb"
+    ov = {k: args[k] for k in ("ephem_err", "ho_lead", "w_el", "w_dwell", "hyst", "compromised")}
+    main(sk, gp, no_viz=args["no_viz"], seed=args["seed"], overrides=ov)

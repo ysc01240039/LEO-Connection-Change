@@ -3,15 +3,20 @@
   Python -> ns-3 : scenario_config.json  （场景 + 真实可见窗，ns-3 侧可直接消费）
   ns-3  -> Python: access_trace.csv      （事件 trace，字段与契约一致）
   Python -> Web   : metrics.json         （统计结果，字段与 CSV 指标列对齐）
+
+★ 审计修复（2026-09-02）★
+契约由 14 列扩展为 16 列，新增 `auth_result` / `ebno_db`，
+使认证判定结果与链路质量进入 trace，指标可审计（原仅在代码里判定，trace 无痕）。
 """
 import json
 import csv
 from .config import DATA_DIR
 
-# 契约 14 列（与 .ns3_ref/leo_access.cc 输出表头严格一致，勿改顺序）
+# 契约 16 列（与 .ns3_ref/leo_access.cc 输出表头严格一致，勿改顺序）
 TRACE_COLS = ["event_type", "terminal", "tag", "t_s", "serving_sat",
               "target_sat", "value_ms", "doppler_hz", "slant_km",
-              "result", "predict_mismatch", "pingpong", "ho_el_cost_deg", "forged"]
+              "result", "predict_mismatch", "pingpong", "ho_el_cost_deg", "forged",
+              "auth_result", "ebno_db"]
 
 
 def write_scenario_json(path, scenario, provenance, windows):
