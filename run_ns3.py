@@ -157,7 +157,25 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
 
     print(f"[3/5] 解析 ns-3 真实 trace ...")
     trace = ns3_io.parse_ns3_trace(ns3_io.NS3_OUT / "access_trace.csv")
-    summary = {"auth_extra_ms": round(auth_extra_ms, 6)}
+    summary = {"auth_extra_ms": round(auth_extra_ms, 6),
+               "total_dur": params["sim_duration_s"]}
+    # ★P1/P2 双轨对齐★：解析 ns-3 stdout 的 [P2] 统计行，回填 summary（对齐 Python protocol.py）
+    _p2_map = {"预迁移命中": ("n_premig_hit", int), "预迁移回退": ("n_premig_miss", int),
+               "假名轮换": ("n_pseudo_rotation", int),
+               "切换总时延和ms": ("ho_total_ms_sum", float),
+               "重连额外时延和ms": ("rerach_extra_ms", float)}
+    for line in (r.stdout + r.stderr).splitlines():
+        if "[P2]" not in line:
+            continue
+        for tok in line.split():
+            if "=" not in tok:
+                continue
+            k, v = tok.split("=", 1)
+            if k in _p2_map:
+                try:
+                    summary[_p2_map[k][0]] = _p2_map[k][1](v)
+                except ValueError:
+                    pass
     metrics = compute_metrics(trace, summary)
     print("      指标：" + __import__("json").dumps(metrics, ensure_ascii=False))
 

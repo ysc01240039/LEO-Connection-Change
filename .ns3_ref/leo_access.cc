@@ -86,7 +86,9 @@ static double     g_noiseTempK     = 290.0;  // 噪声温度(K)
 static double     g_bitRateBps     = 100e3;  // 业务速率(bps)
 static bool       g_linkModelOn    = true;   // 链路模型开关
 static bool       g_preMigrate     = true;   // D3：认证上下文星间预迁移开关（镜像 Python 轨）
-// D3：每星独立认证上下文 {satId -> {pseudo -> counter}}，预迁移机制的状态载体
+// D3：每星独立认证上下文 {satId -> {term_id -> counter}}，预迁移机制的状态载体。
+// ★P2★ 键用 term_id（内部稳定标识）而非信令假名——假名每次切换轮换，内部索引须稳定
+// （镜像 Python protocol.sat_ctx，键=term_id）。
 static std::map<uint32_t, std::map<uint32_t, uint32_t>> g_satCtx;
 static uint64_t   g_rngSeed        = 20260901; // 运行种子（★可配置，原固定 12345★）
 static uint32_t   g_macBytes       = 4;      // MAC 截断长度(字节) → 盲猜 2^-32
@@ -130,6 +132,9 @@ static std::ofstream g_trace;
 static uint64_t g_dbg_attempt = 0, g_dbg_req = 0, g_dbg_forged_blocked = 0,
                 g_dbg_collision_fail = 0, g_dbg_forged_missed = 0,
                 g_dbg_confirm_fail = 0, g_dbg_rerach = 0;
+// ★P1/P2 双轨对齐统计★：镜像 Python protocol.py summary 字段
+static uint64_t g_dbg_premig_hit = 0, g_dbg_premig_miss = 0, g_dbg_pseudo_rotation = 0;
+static double   g_dbg_ho_total_ms = 0.0, g_dbg_rerach_extra_ms = 0.0;
 
 // ============================ 向量/几何辅助 ============================
 static double norm3(const Ecef& a){ return std::sqrt(a.x*a.x+a.y*a.y+a.z*a.z); }
@@ -430,13 +435,29 @@ static void deriveDevKey(const uint8_t root[32], uint32_t termId, uint8_t out[32
   memcpy(msg+38, &termId, 4);
   hmacSha256(root, 32, msg, 42, out);
 }
-static void makePseudo(const uint8_t root[32], uint32_t termId, uint8_t out[4]){
-  uint8_t msg[42], mac[32];
+// ★P2 假名轮换★：epoch 加入派生输入 → 假名随轮换版本变化（切换前后假名不同，前向不可关联）。
+static void makePseudo(const uint8_t root[32], uint32_t termId, uint32_t epoch, uint8_t out[4]){
+  uint8_t msg[46], mac[32];
   memcpy(msg, root, 32);
   memcpy(msg+32, "pseudo", 6);
   memcpy(msg+38, &termId, 4);
-  hmacSha256(root, 32, msg, 42, mac);
+  memcpy(msg+42, &epoch, 4);
+  hmacSha256(root, 32, msg, 46, mac);
   memcpy(out, mac, 4);
+}
+// ★P2 哈希链续认证★：首联下发种子 + 切换时单向推进（对应 Python auth.gen_chain_seed/chain_next）
+static void genChainSeed(const uint8_t root[32], uint32_t termId, uint8_t out[32]){
+  uint8_t msg[41];
+  memcpy(msg, root, 32);
+  memcpy(msg+32, "chain", 5);
+  memcpy(msg+37, &termId, 4);
+  sha256(msg, 41, out);
+}
+static void chainNext(const uint8_t seed[32], uint8_t out[32]){
+  uint8_t msg[37];
+  memcpy(msg, "CHAIN", 5);
+  memcpy(msg+5, seed, 32);
+  sha256(msg, 37, out);
 }
 static uint32_t readBE32(const uint8_t* p){
   return (uint32_t(p[0])<<24)|(uint32_t(p[1])<<16)|(uint32_t(p[2])<<8)|p[3];
@@ -577,8 +598,10 @@ public:
   // 终端初始化凭证（合法终端与密钥泄露型伪造终端持有效 dev_key）
   void InitCredential(const uint8_t root[32]){
     deriveDevKey(root, m_termIdx, m_devKey);
-    uint8_t ps[4]; makePseudo(root, m_termIdx, ps);
+    m_epoch = 0;
+    uint8_t ps[4]; makePseudo(root, m_termIdx, m_epoch, ps);
     m_pseudo = readBE32(ps);
+    genChainSeed(root, m_termIdx, m_chainSeed);  // ★P2★ 首联 MsgB 下发哈希链种子
   }
 
   // 被链路调度调用的接收
@@ -777,7 +800,8 @@ public:
       // ★审计修复（2026-09-02 第 2 轮，镜像 Python 轨）★：重叠候选在决策时刻 tHo 已可见，
       // 预测式「先建后断」应即刻建链（可连时刻 = tHo），而非等到预测 LOS。
       // 原 candConnect=tLos 使 hoLead 提前量被完全旁路（中断≈max(0, LOS 预测高估误差)）。
-      if (g_preMigrate) g_satCtx[cand][m_pseudo] = g_satCtx[m_servingSat][m_pseudo];  // D3 预迁移
+      RotateCredential();  // ★P2★ 假名轮换 + 哈希链推进（每次切换）
+      if (g_preMigrate) g_satCtx[cand][m_termIdx] = g_satCtx[m_servingSat][m_termIdx];  // D3 预迁移（键=term_id）
       DoHandover(cand, t, tHo, tLosTrue, candLos, tHo);
       return;
     }
@@ -791,8 +815,20 @@ public:
       }
     }
     if (nid == 0) return;   // 全仿真无后续可见星，保持当前连接至结束
-    if (g_preMigrate) g_satCtx[nid][m_pseudo] = g_satCtx[m_servingSat][m_pseudo];  // D3 预迁移
+    RotateCredential();  // ★P2★ 假名轮换 + 哈希链推进（每次切换）
+    if (g_preMigrate) g_satCtx[nid][m_termIdx] = g_satCtx[m_servingSat][m_termIdx];  // D3 预迁移（键=term_id）
     DoHandover(nid, t, naos, tLosTrue, nlos, tLos);
+  }
+
+  // ★P2 假名轮换 + 哈希链推进★：每次切换递增 epoch、重派生信令假名、哈希链单向推进
+  // （镜像 Python protocol.py 切换分支：term_epoch+1 → make_pseudo(epoch) → chain_next）。
+  void RotateCredential(){
+    uint8_t root[32]; deriveRootKey(root);
+    m_epoch++;
+    uint8_t ps[4]; makePseudo(root, m_termIdx, m_epoch, ps);
+    m_pseudo = readBE32(ps);
+    uint8_t ns[32]; chainNext(m_chainSeed, ns); memcpy(m_chainSeed, ns, 32);
+    g_dbg_pseudo_rotation++;  // ★P2★ 假名轮换总次数（可审计「每次切换轮换」）
   }
 
 private:
@@ -808,7 +844,9 @@ private:
   bool m_forged;          // T4：伪造终端标记（抽样标签，仅用于 trace 分流与指标统计）
   bool m_compromised;     // ★审计修复★：密钥泄露型伪造（持有效 dev_key，密码层不可检出）
   uint8_t m_devKey[32];   // 终端派生密钥（合法终端与泄露型伪造持有效密钥）
-  uint32_t m_pseudo;      // 假名标识
+  uint32_t m_pseudo;      // 假名标识（信令中替代明文长期身份）
+  uint32_t m_epoch;       // ★P2★ 假名轮换版本（首联=0，每次切换 +1）
+  uint8_t m_chainSeed[32];// ★P2★ 哈希链当前链头（首联下发种子，切换单向推进）
   uint32_t m_retryCnt;    // 碰撞退避重试计数（超 g_retryMax 判失败）
   uint32_t m_servingSat;
   double m_servingLos;
@@ -852,14 +890,22 @@ private:
     // 属结构性恒等而非算法成果。现中断相对**真实** LOS 计算（预测高估 → 中断>0）。
     // ★审计修复（2026-09-02 第 2 轮，镜像 Python 轨）★：重连确认须在目标可达（candConnect）
     // 之后才能收发，故新链可用 = candConnect + execS（原从 tHo 起算取 max）。
-    double execS = 2.0*delay + g_accessProcMs/1000.0 + g_authExtraMs/1000.0;
-    bool hasCtx = g_satCtx.count(cand) && g_satCtx[cand].count(m_pseudo) > 0;  // D3
-    if (!hasCtx){
-      // 无预迁移：终端须在新星重新随机接入（完整接入流程），含前导竞争与附加调度时延
+    double execS;
+    bool hasCtx = g_satCtx.count(cand) && g_satCtx[cand].count(m_termIdx) > 0;  // D3（键=term_id）
+    // ★P1 修复（镜像 Python protocol.py）★：重连时延 if/else 二选一，不再重复计数基础段。
+    // 原实现 execS 先初始化基础段、无预迁移时再累加基础段+rerach → 重复计数。
+    if (hasCtx){
+      // 有预迁移：新星持预置上下文，一次比对即确认（RACH-less）
+      execS = 2.0*delay + g_accessProcMs/1000.0 + g_authExtraMs/1000.0;
+      g_dbg_premig_hit++;
+    } else {
+      // 无预迁移：终端须在新星重新随机接入（四步 RACH 完整流程总时延）
       double rerach = step4ExtraMsCalc(delay*1000.0);
-      execS += (2.0*delay + g_accessProcMs/1000.0 + rerach/1000.0);
-      g_dbg_rerach++;
+      execS = rerach/1000.0 + g_accessProcMs/1000.0 + g_authExtraMs/1000.0;
+      g_dbg_premig_miss++;
+      g_dbg_rerach_extra_ms += rerach - 2.0*delay*1000.0;  // 重连额外 = step4 − 2×传播（镜像 Python rerach_extra_ms）
     }
+    g_dbg_ho_total_ms += execS * 1000.0;  // 切换总时延累加（镜像 Python ho_total_ms_sum）
     double avail = candConnect + execS;
     double interrupt_ms = std::max(0.0, avail - losTrue) * 1000.0;
     // ---- T7 重连确认（★审计修复★：原无条件 success，无任何失败路径）----
@@ -901,7 +947,7 @@ private:
       // auth_result=ok_missed）；接入成功率仅统计合法终端（forged=0），互不污染。
       const char* authRes = (m_forged && m_compromised) ? "ok_missed" : "ok";
       if (m_forged && m_compromised) g_dbg_forged_missed++;
-      g_satCtx[h.satId][m_pseudo] = m_retryCnt + 1;  // D3：服务星记录终端认证上下文
+      g_satCtx[h.satId][m_termIdx] = m_retryCnt + 1;  // D3：服务星记录终端认证上下文（键=term_id）
       g_trace << "ACCESS," << m_termIdx << "," << m_tag << "," << std::fixed
               << std::setprecision(3) << t << "," << h.satId << "," << h.satId << ","
               << std::setprecision(2) << delay_ms << ","
@@ -1306,6 +1352,11 @@ int main(int argc, char* argv[]){
             << " 伪造拦截=" << g_dbg_forged_blocked << " 碰撞重试超限失败=" << g_dbg_collision_fail
             << " 漏检(密钥泄露)=" << g_dbg_forged_missed
             << " 确认失败=" << g_dbg_confirm_fail << " 重连回退(RACH)=" << g_dbg_rerach << std::endl;
+  // ★P1/P2 双轨对齐统计★：供 run_ns3.py 解析后回填 summary（对齐 Python protocol.py）
+  std::cout << "  [P2] 预迁移命中=" << g_dbg_premig_hit << " 预迁移回退=" << g_dbg_premig_miss
+            << " 假名轮换=" << g_dbg_pseudo_rotation
+            << " 切换总时延和ms=" << std::fixed << std::setprecision(2) << g_dbg_ho_total_ms
+            << " 重连额外时延和ms=" << std::setprecision(2) << g_dbg_rerach_extra_ms << std::endl;
   if (g_priorityMode == "dp"){
     double avgGh = (g_dpNGuard > 0) ? (g_dpSumGh / (double)g_dpNGuard) : 0.0;
     uint64_t reclaim = 0; for (auto& kv : g_dpReclaim) reclaim += kv.second;
