@@ -43,7 +43,7 @@ def win2wsl(p: str) -> str:
 def parse_args(argv):
     args = {"seed": 20260901, "no_viz": False, "ephem_err": None,
             "ho_lead": None, "w_el": None, "w_dwell": None, "hyst": None,
-            "compromised": None}
+            "compromised": None, "prio_mode": None}
     pos, i = [], 0
     while i < len(argv):
         a, nxt = argv[i], (argv[i + 1] if i + 1 < len(argv) else None)
@@ -61,6 +61,8 @@ def parse_args(argv):
             args["hyst"] = float(nxt); i += 2
         elif a == "--compromised" and nxt:
             args["compromised"] = float(nxt); i += 2
+        elif a == "--prio-mode" and nxt:
+            args["prio_mode"] = nxt; i += 2
         elif a == "--no-viz":
             args["no_viz"] = True; i += 1
         else:
@@ -85,13 +87,17 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
     w_dwell = ov.get("w_dwell", HO_W_DWELL)
     hyst = ov.get("hyst", sc.get("ho_hyst", 0.0))
     compromised = ov.get("compromised", sc.get("compromised_share", 0.15))
+    pm = ov.get("prio_mode", sc.get("priority_mode", "static"))  # ★科学版 dp★ 调度模式透传
     auth_extra_ms = _auth.measure_verify_ms() * AUTH_CPU_DERATE
     params = dict(mask_deg=MASK_ANGLE_DEG, sim_duration_s=SIM_DURATION_S,
                   time_step_s=TIME_STEP_S,
                   burst_start_s=sc.get("burst_start_s", 5),
                   burst_window_s=sc.get("burst_ramp_s", 60),
                   access_proc_ms=sc.get("access_proc_ms", 3.0),
-                  ho_lead_s=ho_lead, tick_s=TICK_S, carrier_hz=CARRIER_FREQ_HZ)
+                  ho_lead_s=ho_lead, tick_s=TICK_S, carrier_hz=CARRIER_FREQ_HZ,
+                  # ★一致性修复（2026-09-02 第 2 轮）★：实测认证时延入 params，
+                  # 使 scenario.json 溯源快照记录真实透传值（原写死 0.0）
+                  auth_extra_ms=round(auth_extra_ms, 6))
     ns3_io.gen_ephemeris(sats, ts, params["time_step_s"], params["sim_duration_s"],
                          ns3_io.NS3_IN / "ephemeris.csv")
     ns3_io.gen_terminals(sc, ns3_io.NS3_IN / "terminals.csv", seed=seed)
@@ -117,6 +123,7 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
         f"--rachSteps={sc.get('rach_steps', 2)} "
         f"--collisionOn={1 if sc.get('collision_on', False) else 0} "
         f"--priorityOn={1 if sc.get('priority_on', True) else 0} "
+        f"--prioMode={pm} "
         f"--prioResHigh={PRIORITY_RESERVE_FRAC[0]} "
         f"--prioResMed={PRIORITY_RESERVE_FRAC[1]} "
         f"--prioResLow={PRIORITY_RESERVE_FRAC[2]} "
@@ -145,7 +152,7 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
     for line in out.splitlines():
         if "ns-3 调度墙钟时间=" in line:
             wall_s = line.split("=")[-1].strip().rstrip("s")
-    for line in out.splitlines()[-6:]:
+    for line in out.splitlines()[-8:]:
         print("      " + line)
 
     print(f"[3/5] 解析 ns-3 真实 trace ...")
@@ -179,5 +186,5 @@ if __name__ == "__main__":
     pos, args = parse_args([a for a in sys.argv[1:]])
     sk = pos[0] if len(pos) > 0 else "wenchuan"
     gp = pos[1] if len(pos) > 1 else "oneweb"
-    ov = {k: args[k] for k in ("ephem_err", "ho_lead", "w_el", "w_dwell", "hyst", "compromised")}
+    ov = {k: args[k] for k in ("ephem_err", "ho_lead", "w_el", "w_dwell", "hyst", "compromised", "prio_mode")}
     main(sk, gp, no_viz=args["no_viz"], seed=args["seed"], overrides=ov)

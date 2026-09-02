@@ -10,7 +10,6 @@
 """
 import json
 import csv
-from .config import DATA_DIR
 
 # 契约 16 列（与 .ns3_ref/leo_access.cc 输出表头严格一致，勿改顺序）
 TRACE_COLS = ["event_type", "terminal", "tag", "t_s", "serving_sat",

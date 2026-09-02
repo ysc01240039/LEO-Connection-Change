@@ -1,6 +1,9 @@
 # 工具内部数据，不随项目上传
 .workbuddy/
 
+# 工作日志 / 过程性评估报告（与代码、正式文档分离，不随仓库上传）
+logs/
+
 # 按需求排除的清单文件
 姚世宸_前置任务清单.md
 
@@ -13,6 +16,7 @@ __pycache__/
 
 # 仿真生成产物（输入保留可复现，产物不入库；再次运行一键再生成）
 data/sim/ns3_out/
+data/sim/ns3_in/
 data/sim/runs/
 data/sim/*.csv
 data/sim/*.json

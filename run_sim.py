@@ -32,7 +32,8 @@ def parse_args(argv):
     args = {"seed": 20260901, "reps": 1, "no_viz": False,
             "ho_lead": None, "ephem_err": None, "w_el": None, "w_dwell": None,
             "hyst": None, "compromised": None, "no_link": False,
-            "no_priority": False, "priority_cmp": False, "rel17": False}
+            "no_priority": False, "priority_cmp": False, "rel17": False,
+            "no_pre_migrate": False, "prio_mode": "static"}
     pos = []
     i = 0
     while i < len(argv):
@@ -62,6 +63,10 @@ def parse_args(argv):
             args["no_priority"] = True; i += 1
         elif a == "--priority-cmp":
             args["priority_cmp"] = True; i += 1
+        elif a == "--no-pre-migrate":
+            args["no_pre_migrate"] = True; i += 1
+        elif a == "--prioMode" and nxt:
+            args["prio_mode"] = nxt; i += 2
         elif a == "--rel17":
             args["rel17"] = True; i += 1
         else:
@@ -156,15 +161,26 @@ def main(scenario_key="wenchuan", group="oneweb", seed=20260901, reps=1,
         print("      优先级关闭时 low危终端拒绝数:", m_off.get("low危终端拒绝数"),
               " high危终端拒绝数:", m_off.get("high危终端拒绝数"))
 
-    # ---- ③ Rel-17 基线提升%：跑 rel17_baseline 对照 ----
+    # ---- ③ Rel-17 基线提升%：受控方案对照（★修复 2026-09-02 第 3 轮★）----
+    # 旧实现把「用户传入的场景」直接当提案去比 rel17_baseline，跑 wenchuan（容量64/平缓突发）
+    # 对比 rel17_baseline（容量4/呼叫风暴）时出现容量错配伪差（成功率 −70.1%）。
+    # 现改为受控实验：提案 = 从 rel17_baseline 继承全部【负载】参数（容量/突发/终端/
+    # 伪造比例/危险度分层），仅翻转【接入/切换范式】四项（rach_steps / ho_lead_s /
+    # priority_on / pre_migrate），确保对照只反映方案差异。wenchuan_storm2 即等于该受控
+    # 提案，结果一致；对任意场景调用 --rel17 都得到同负载受控对照，杜绝错配类伪差。
     if rel17:
-        print("[4.6/6] Rel-17 基线对照：跑 rel17_baseline ...")
+        print("[4.6/6] Rel-17 基线对照：受控方案(同负载·仅改范式) ...")
         sc_base = get_scenario("rel17_baseline")
+        sc_prop = dict(sc_base)
+        sc_prop["name"] = "本方案（两步RACH+预测切换+生存优先+星间预迁移，同负载）"
+        sc_prop["rach_steps"] = 2
+        sc_prop["ho_lead_s"] = 20.0
+        sc_prop["priority_on"] = True
+        sc_prop["pre_migrate"] = True
         m_base, _, _, _, _ = _sim_core(sc_base, group, seed, {}, no_link)
-        # 公平隔离：本方案也在相同 5s 星历误差下重跑，仅 RACH 步数 + 切换范式不同
+        # 公平隔离：同 5s 星历误差
         params_p = dict(params)
         params_p["ephem_err_s"] = 5.0
-        sc_prop = dict(get_scenario(scenario_key))
         m_prop, _, _, _, _ = _sim_core(sc_prop, group, seed, params_p, no_link)
         imp = rel17_improvement(m_base, m_prop)
         comparison["rel17"] = {"基线指标": m_base, "本方案(同误差)指标": m_prop, "提升%": imp}
@@ -212,6 +228,10 @@ if __name__ == "__main__":
     sk = pos[0] if len(pos) > 0 else "wenchuan"
     gp = pos[1] if len(pos) > 1 else "oneweb"
     ov = {k: args[k] for k in ("ho_lead", "ephem_err", "w_el", "w_dwell", "hyst", "compromised")}
+    if args["prio_mode"] != "static":
+        ov["priority_mode"] = args["prio_mode"]
+    if args["no_pre_migrate"]:
+        ov["pre_migrate"] = False
     main(sk, gp, seed=args["seed"], reps=args["reps"], no_viz=args["no_viz"],
          overrides=ov, no_link=args["no_link"],
          priority_cmp=args["priority_cmp"], rel17=args["rel17"])

@@ -49,6 +49,24 @@ SCENARIOS = {
         "ho_hyst": 0.0,
         "note": "呼叫风暴：1s 内 1200 终端涌入，10ms 时间片仅 4 前导码 → 碰撞/拥塞显现",
     },
+    "wenchuan_storm2_lowhigh": {
+        "name": "汶川灾区（低高危负载·回收对照）",
+        "lat": 31.0083, "lon": 103.5833, "alt_m": 1326,
+        "terminals": 1200,
+        "burst_start_s": 5,
+        "burst_ramp_s": 1,
+        "access_proc_ms": 3.0,
+        "danger_tags": {"high": 0.05, "med": 0.35, "low": 0.60},
+        "forged_ratio": 0.05,
+        "compromised_share": 0.15,
+        "rach_steps": 2,
+        "collision_on": True,
+        "rach_capacity": 4,
+        "retry_interval_ms": 500.0,
+        "retry_max": 3,
+        "ho_hyst": 0.0,
+        "note": "低高危(5%)：验证科学版 dp 调度在高危终端稀少时回收闲置预留，中/低危成功率↑而高危不变",
+    },
     "wenchuan_storm4": {
         "name": "汶川地震灾区（呼叫风暴对照·Rel-17 四步 RACH 基线）",
         "lat": 31.0083, "lon": 103.5833, "alt_m": 1326,
@@ -109,7 +127,8 @@ SCENARIOS = {
         "ephem_err_s": 5.0,               # 真实星历漂移：反应式切换无法补偿 → 中断非零
         "ho_hyst": 0.0,
         "priority_on": False,             # 无生存优先
-        "note": "Rel-17 NTN 标准范式基线：四步 RACH + 反应式切换 + 无优先级；"
+        "pre_migrate": False,            # ★受控对照：基线 = 纯 Rel-17，不含本项目的星间认证上下文预迁移(D3)★
+        "note": "Rel-17 NTN 标准范式基线：四步 RACH + 反应式切换 + 无优先级 + 无星间预迁移；"
                 "与 wenchuan_storm2(两步+预测+优先级) 同负载对照，量化本方案提升%",
     },
 }

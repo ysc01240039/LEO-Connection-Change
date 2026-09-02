@@ -54,6 +54,9 @@ static std::map<uint32_t, Ptr<LeoApp>>           g_apps;     // nodeId -> App
 static NodeContainer                            g_satNodes;  // 卫星节点容器
 static std::map<uint32_t, uint32_t>             g_satId2Idx; // satNodeId -> 索引
 
+// ---- 协议/物理参数默认值（★镜像 sim/config.py，仅供直接运行 scratch 时兜底★）----
+// 正式驱动（run_ns3.py）会将全部参数经命令行显式透传覆盖此处默认值，
+// 修改参数请改 sim/config.py / sim/scenario.py，勿只改此处（双轨会漂移）。
 static double g_maskDeg = 25.0;
 static double g_carrierHz = 2.0e9;
 static double g_hoLeadS = 20.0;
@@ -82,6 +85,9 @@ static double     g_gtDbiK         = -20.0;  // 终端 G/T(dB/K)
 static double     g_noiseTempK     = 290.0;  // 噪声温度(K)
 static double     g_bitRateBps     = 100e3;  // 业务速率(bps)
 static bool       g_linkModelOn    = true;   // 链路模型开关
+static bool       g_preMigrate     = true;   // D3：认证上下文星间预迁移开关（镜像 Python 轨）
+// D3：每星独立认证上下文 {satId -> {pseudo -> counter}}，预迁移机制的状态载体
+static std::map<uint32_t, std::map<uint32_t, uint32_t>> g_satCtx;
 static uint64_t   g_rngSeed        = 20260901; // 运行种子（★可配置，原固定 12345★）
 static uint32_t   g_macBytes       = 4;      // MAC 截断长度(字节) → 盲猜 2^-32
 static std::map<std::pair<uint32_t,uint32_t>, uint32_t> g_slotLoad; // (sat,10ms槽)->已受理数
@@ -101,10 +107,29 @@ static bool       g_priorityOn     = true;  // 生存优先调度开关（defaul
 static double     g_prioReserveFrac[3] = {0.5, 0.3, 0.2}; // high/med/low 专用预留比例（同 config.PRIORITY_RESERVE_FRAC）
 static double     g_prioBackoff[3] = {0.3, 0.6, 1.0}; // high/med/low 退避缩放（同 config.PRIO_BACKOFF）
 static std::map<std::pair<uint32_t,uint32_t>, uint32_t> g_slotP[3]; // 三档专用池 (sat,10ms槽)->已受理数
+// ---- ★科学版 dp 自适应阈值（★镜像 sim/protocol.py priority_mode="dp" + sim/prio_opt.py★）----
+// 替代静态比例 g_prioReserveFrac：用 Kaufman-Roberts 生灭过程精确解，按在线 EWMA 估计的
+// 各档到达率，每窗口重算最优 guard-channel 阈值 (g_h, g_m)，低危负载时回收高危闲置预留。
+static std::string g_priorityMode = "static"; // "static" | "dp"（default 与场景 priority_mode 一致）
+static double g_prioEps      = 0.12;  // 高危阻塞率 QoS 上界 ε（同 config.PRIO_EPS）
+static double g_prioBeta     = 0.30;  // EWMA 新窗口权重（同 config.PRIO_BETA）
+static double g_prioWm       = 1.00, g_prioWl = 1.00; // 目标函数权重(中,低)（同 config.PRIO_WEIGHTS）
+static double g_prioLoadCal  = 0.80;  // 损失模型负载标定：模型偏保守，乘此系数对齐仿真实测（同 config.PRIO_LOAD_CAL）
+static double g_prioAdaptWinS= 1.00;  // 阈值自适应窗口(s)（同 config.PRIO_ADAPT_WIN_S）
+static std::map<std::pair<uint32_t,uint32_t>, uint32_t> g_dpOcc;     // (sat,10ms槽)->总占用
+static std::map<std::pair<uint32_t,uint32_t>, double>   g_dpEwma;    // (sat,tier)->λ EWMA
+static std::map<std::pair<uint32_t,uint32_t>, double>   g_dpWincnt;  // (sat,tier)->当前窗口到达计数
+static std::map<uint32_t, int64_t> g_dpWin;        // sat -> 当前窗口索引
+static std::map<uint32_t, std::pair<int,int>> g_dpGuards; // sat -> (g_h, g_m) 当前最优阈值
+static std::map<uint32_t, uint64_t> g_dpReclaim;  // sat -> med/low 占用高危预留区回收次数
+static double   g_dpSumGh = 0.0;  // 跨窗口 g_h 累加（报告平均预留）
+static uint64_t g_dpNGuard = 0;   // 阈值重算次数
+static uint32_t g_dpDefGh = 2, g_dpDefGm = 1; // 默认阈值（static 比例推导，首窗口前兜底）
+static uint32_t g_dpSlotPerWin = 100; // 每窗口 10ms 槽数 = adaptWinS/0.01
 static std::ofstream g_trace;
 static uint64_t g_dbg_attempt = 0, g_dbg_req = 0, g_dbg_forged_blocked = 0,
                 g_dbg_collision_fail = 0, g_dbg_forged_missed = 0,
-                g_dbg_confirm_fail = 0;
+                g_dbg_confirm_fail = 0, g_dbg_rerach = 0;
 
 // ============================ 向量/几何辅助 ============================
 static double norm3(const Ecef& a){ return std::sqrt(a.x*a.x+a.y*a.y+a.z*a.z); }
@@ -183,6 +208,74 @@ static double prioBackoffScale(uint32_t prio){
   if (prio < 3) return g_prioBackoff[prio];
   return 1.0;
 }
+
+// ============================ ★科学版 dp 调度：Kaufman-Roberts 生灭过程精确解 ============================
+// 1D 生灭链稳态占用 π[0..c]（精确，非近似）：birth(k)=A_h·1[k<c]+A_m·1[k<c-g_h]+A_l·1[k<c-g_h-g_m]，
+// death(k)=k+1；π(b+1)=π(b)·birth(b)/death(b+1)。阻塞：B_h=π(c)，B_m=Σ_{b≥c-g_h}π，B_l=Σ_{b≥c-g_h-g_m}π。
+// 最优阈值 (g_h*,g_m*)=argmin( w_m·B_m+w_l·B_l ) s.t. B_h≤ε；不可行时退化为 argmin B_h（保高危）。
+static void dpBirthDeathPi(uint32_t c, double Ah, double Am, double Al,
+                            int gh, int gm, std::vector<double>& pi){
+  pi.assign(c + 1, 0.0);
+  pi[0] = 1.0;
+  int c_h = (int)c - gh, c_l = (int)c - gh - gm;
+  for (uint32_t b = 0; b < c; ++b){
+    double birth = 0.0;
+    if (b < c)            birth += Ah;
+    if (b < (uint32_t)c_h) birth += Am;
+    if (b < (uint32_t)c_l) birth += Al;
+    double death = (double)b + 1.0;
+    pi[b + 1] = (death > 0.0) ? pi[b] * (birth / death) : 0.0;
+  }
+  double s = 0.0; for (double v : pi) s += v;
+  if (s <= 0.0){ pi.assign(c + 1, 0.0); pi[0] = 1.0; return; }
+  for (double& v : pi) v /= s;
+}
+static double r8(double x){ return std::round(x * 1e8) / 1e8; } // 与 Python optimal_guards round(_,8) 对齐
+static void dpOptimalGuards(uint32_t c, double Ah, double Am, double Al,
+                            double wm, double wl, double eps,
+                            int& out_gh, int& out_gm,
+                            double& out_bh, double& out_bm, double& out_bl){
+  out_gh = 0; out_gm = 0; out_bh = 1.0; out_bm = 1.0; out_bl = 1.0;
+  int    best_k0 = 2; double best_k1 = 1e9, best_k2 = 1e9;
+  std::vector<double> pi;
+  for (int gh = 0; gh <= (int)c; ++gh){
+    for (int gm = 0; gm <= (int)c - gh; ++gm){
+      dpBirthDeathPi(c, Ah, Am, Al, gh, gm, pi);
+      double bh  = pi[c];
+      int c_h = (int)c - gh, c_l = (int)c - gh - gm;
+      double bm = 0.0, bl = 0.0;
+      for (int b = c_h; b <= (int)c; ++b) if (b >= 0) bm += pi[b];
+      for (int b = c_l; b <= (int)c; ++b) if (b >= 0) bl += pi[b];
+      bool feasible = (bh <= eps);
+      double obj = wm * bm + wl * bl;
+      int    key0 = feasible ? 0 : 1;
+      double key1 = r8(feasible ? obj : bh);
+      double key2 = r8(feasible ? bh  : obj);
+      bool better = false;
+      if (key0 < best_k0) better = true;
+      else if (key0 == best_k0){
+        if (key1 < best_k1 - 1e-12) better = true;
+        else if (std::fabs(key1 - best_k1) <= 1e-12 && key2 < best_k2 - 1e-12) better = true;
+      }
+      if (best_k0 == 2 || better){
+        best_k0 = key0; best_k1 = key1; best_k2 = key2;
+        out_gh = gh; out_gm = gm; out_bh = bh; out_bm = bm; out_bl = bl;
+      }
+    }
+  }
+}
+static void dpRecompute(uint32_t sat){
+  double ah = g_dpEwma[{sat, 0u}] * g_prioLoadCal;
+  double am = g_dpEwma[{sat, 1u}] * g_prioLoadCal;
+  double al = g_dpEwma[{sat, 2u}] * g_prioLoadCal;
+  int gh, gm; double bh, bm, bl;
+  dpOptimalGuards(g_rachCapacity, ah, am, al, g_prioWm, g_prioWl, g_prioEps,
+                  gh, gm, bh, bm, bl);
+  g_dpGuards[sat] = {gh, gm};
+  g_dpSumGh += (double)gh;
+  g_dpNGuard += 1;
+}
+
 static bool slotOk(uint32_t satId, double t, uint32_t prio){
   if (!g_collisionOn) return true;
   uint32_t slot10 = (uint32_t)(t / 0.01);
@@ -192,6 +285,42 @@ static bool slotOk(uint32_t satId, double t, uint32_t prio){
     if (used >= g_rachCapacity) return false;
     g_slotLoad[key] = used + 1;
     return true;
+  }
+  if (g_priorityMode == "dp"){
+    // --- 窗口推进：结算上一窗口（仅非首窗口）→ EWMA 更新 + 重算最优阈值 ---
+    int win = (int)(t / g_prioAdaptWinS);
+    int sat_win = (g_dpWin.count(satId) ? (int)g_dpWin[satId] : -1);
+    if (sat_win == -1 || win != sat_win){
+      if (sat_win != -1){
+        for (int tier = 0; tier < 3; ++tier){
+          double raw = g_dpWincnt[{satId, (uint32_t)tier}] / (double)g_dpSlotPerWin;
+          auto eit = g_dpEwma.find({satId, (uint32_t)tier});
+          double prev = (eit == g_dpEwma.end()) ? 0.0 : eit->second;
+          g_dpEwma[{satId, (uint32_t)tier}] = (eit == g_dpEwma.end())
+              ? raw : (g_prioBeta * raw + (1.0 - g_prioBeta) * prev);
+        }
+        dpRecompute(satId);
+      }
+      g_dpWin[satId] = win;
+      for (int tier = 0; tier < 3; ++tier) g_dpWincnt[{satId, (uint32_t)tier}] = 0.0;
+    }
+    // --- guard-channel 准入（窗口/到达计数在 AttemptAccess 按「首次尝试」更新）---
+    int gh = (int)g_dpDefGh, gm = (int)g_dpDefGm;
+    auto git = g_dpGuards.find(satId);
+    if (git != g_dpGuards.end()){ gh = git->second.first; gm = git->second.second; }
+    uint32_t occ = g_dpOcc.count({satId, slot10}) ? g_dpOcc[{satId, slot10}] : 0;
+    bool ok;
+    if      (prio == 0) ok = occ < g_rachCapacity;
+    else if (prio == 1) ok = occ < g_rachCapacity - (uint32_t)gh;
+    else                ok = occ < g_rachCapacity - (uint32_t)gh - (uint32_t)gm;
+    if (ok){
+      g_dpOcc[{satId, slot10}] = occ + 1;
+      // 回收计数：med/low 落入高危预留区 [c-gh, c) → 闲置预留被复用
+      if (prio != 0 && occ >= g_rachCapacity - (uint32_t)gh)
+        g_dpReclaim[satId] = g_dpReclaim.count(satId) ? g_dpReclaim[satId] + 1 : 1;
+      return true;
+    }
+    return false;
   }
   // 三档专用池容量（余数归 low，保证总容量=rach_capacity）
   uint32_t cap[3];
@@ -492,6 +621,10 @@ public:
     // ★审计修复★：伪造终端同样占信道（星上须先接收再校验拒绝），与真实系统一致；
     // 原实现「伪造不占信道」高估了系统抗伪造风暴能力。
     // ★生存优先★：优先级感知 RACH 容量判定（镜像 Python protocol._slot_ok）
+    // ★科学版 dp★：仅「首次尝试」(m_retryCnt==0) 计入到达率 EWMA（重试是阻塞后果，不可回馈估计器）
+    if (g_priorityMode == "dp" && m_retryCnt == 0){
+      g_dpWincnt[{best, m_prio}] = g_dpWincnt[{best, m_prio}] + 1.0;
+    }
     if (g_collisionOn && !slotOk(best, t, m_prio)){
       if (m_retryCnt >= g_retryMax){      // 重试超限 → 接入失败
         g_dbg_collision_fail++;
@@ -636,8 +769,11 @@ public:
         double curScore = hoScore(m_servingSat, tHo);
         if (candScore < curScore + g_hoHyst) return;
       }
-      // 重叠候选在预测 LOS 时刻已可见 → 可连时刻即预测 LOS（先建后断）
-      DoHandover(cand, t, tLos, tLosTrue, candLos, tHo);
+      // ★审计修复（2026-09-02 第 2 轮，镜像 Python 轨）★：重叠候选在决策时刻 tHo 已可见，
+      // 预测式「先建后断」应即刻建链（可连时刻 = tHo），而非等到预测 LOS。
+      // 原 candConnect=tLos 使 hoLead 提前量被完全旁路（中断≈max(0, LOS 预测高估误差)）。
+      if (g_preMigrate) g_satCtx[cand][m_pseudo] = g_satCtx[m_servingSat][m_pseudo];  // D3 预迁移
+      DoHandover(cand, t, tHo, tLosTrue, candLos, tHo);
       return;
     }
     // 候选 B：无重叠候选 → 最早升起星兜底（覆盖盲区，中断如实记录）
@@ -650,6 +786,7 @@ public:
       }
     }
     if (nid == 0) return;   // 全仿真无后续可见星，保持当前连接至结束
+    if (g_preMigrate) g_satCtx[nid][m_pseudo] = g_satCtx[m_servingSat][m_pseudo];  // D3 预迁移
     DoHandover(nid, t, naos, tLosTrue, nlos, tLos);
   }
 
@@ -708,9 +845,17 @@ private:
     // 中断（契约 2.1）：业务间隙 = max(0, 新链可用 − 旧链真实丢失)
     // ★审计修复★：原 avail = max(candConnect, t+2d+proc) 在 ho_lead>12ms 时恒 ≤ LOS，
     // 属结构性恒等而非算法成果。现中断相对**真实** LOS 计算（预测高估 → 中断>0）。
+    // ★审计修复（2026-09-02 第 2 轮，镜像 Python 轨）★：重连确认须在目标可达（candConnect）
+    // 之后才能收发，故新链可用 = candConnect + execS（原从 tHo 起算取 max）。
     double execS = 2.0*delay + g_accessProcMs/1000.0 + g_authExtraMs/1000.0;
-    double confirmT = tHo + execS;
-    double avail = std::max(candConnect, confirmT);
+    bool hasCtx = g_satCtx.count(cand) && g_satCtx[cand].count(m_pseudo) > 0;  // D3
+    if (!hasCtx){
+      // 无预迁移：终端须在新星重新随机接入（完整接入流程），含前导竞争与附加调度时延
+      double rerach = step4ExtraMsCalc(delay*1000.0);
+      execS += (2.0*delay + g_accessProcMs/1000.0 + rerach/1000.0);
+      g_dbg_rerach++;
+    }
+    double avail = candConnect + execS;
     double interrupt_ms = std::max(0.0, avail - losTrue) * 1000.0;
     // ---- T7 重连确认（★审计修复★：原无条件 success，无任何失败路径）----
     // 目标星一次比对令牌：低仰角 → BER 高 → 令牌误码 → 确认失败 → 重传产生额外中断。
@@ -751,6 +896,7 @@ private:
       // auth_result=ok_missed）；接入成功率仅统计合法终端（forged=0），互不污染。
       const char* authRes = (m_forged && m_compromised) ? "ok_missed" : "ok";
       if (m_forged && m_compromised) g_dbg_forged_missed++;
+      g_satCtx[h.satId][m_pseudo] = m_retryCnt + 1;  // D3：服务星记录终端认证上下文
       g_trace << "ACCESS," << m_termIdx << "," << m_tag << "," << std::fixed
               << std::setprecision(3) << t << "," << h.satId << "," << h.satId << ","
               << std::setprecision(2) << delay_ms << ","
@@ -933,6 +1079,7 @@ int main(int argc, char* argv[]){
   double eirpDbm=68, gtDbiK=-20, bitRateBps=100e3;
   uint32_t rarWindowMs=160, contTimerMs=200, nPreamble=64;
   int32_t linkModelOn=1;
+  uint32_t preMigrate=1;   // D3：认证上下文预迁移开关（默认开启）
   uint64_t rngSeed=20260901;   // ★原固定 12345，现可配置（多种子/置信区间实验）★
 
   CommandLine cmd;
@@ -960,6 +1107,8 @@ int main(int argc, char* argv[]){
   cmd.AddValue("prioResHigh", "high 专用预留比例", prioResHigh);
   cmd.AddValue("prioResMed", "med 专用预留比例", prioResMed);
   cmd.AddValue("prioResLow", "low 专用预留比例", prioResLow);
+  std::string prioMode = "static"; // ★科学版 dp★ 调度模式："static" | "dp"
+  cmd.AddValue("prioMode", "生存优先调度模式(static/dp)", prioMode);
   cmd.AddValue("retryIntervalMs", "退避间隔上限(ms)", retryIntervalMs);
   cmd.AddValue("retryMax", "碰撞重试上限", retryMax);
   // ★审计修复：机理参数★
@@ -974,6 +1123,7 @@ int main(int argc, char* argv[]){
   cmd.AddValue("gtDbiK", "终端G/T(dB/K)", gtDbiK);
   cmd.AddValue("bitRateBps", "业务速率(bps)", bitRateBps);
   cmd.AddValue("linkModelOn", "链路模型开关", linkModelOn);
+  cmd.AddValue("preMigrate", "认证上下文预迁移开关(1/0)", preMigrate);
   cmd.AddValue("rngSeed", "随机种子", rngSeed);
   cmd.Parse(argc, argv);
 
@@ -985,11 +1135,16 @@ int main(int argc, char* argv[]){
   g_collisionOn = (collisionOn != 0); g_rachCapacity = rachCapacity;
   g_priorityOn = (priorityOn != 0);
   g_prioReserveFrac[0] = prioResHigh; g_prioReserveFrac[1] = prioResMed; g_prioReserveFrac[2] = prioResLow;
+  g_priorityMode = prioMode;   // ★科学版 dp★ 模式透传
+  g_dpDefGh = std::max(1u, (uint32_t)(g_rachCapacity * g_prioReserveFrac[0]));
+  g_dpDefGm = std::max(1u, (uint32_t)(g_rachCapacity * g_prioReserveFrac[1]));
+  g_dpSlotPerWin = std::max(1u, (uint32_t)(g_prioAdaptWinS / 0.01)); // 每窗口 10ms 槽数
   g_retryIntervalMs = retryIntervalMs; g_retryMax = retryMax;
   g_ephemErrS = ephemErrS; g_wEl = wEl; g_wDwell = wDwell; g_hoHyst = hoHyst;
   g_rarWindowMs = rarWindowMs; g_contTimerMs = contTimerMs; g_nPreamble = nPreamble;
   g_eirpDbm = eirpDbm; g_gtDbiK = gtDbiK; g_bitRateBps = bitRateBps;
   g_linkModelOn = (linkModelOn != 0); g_rngSeed = rngSeed;
+  g_preMigrate = (preMigrate != 0);
   g_runRng.seed((uint32_t)rngSeed);
 
   std::cout << "[LeoAccess] ns-3 离散事件接入/切换仿真启动" << std::endl;
@@ -1003,7 +1158,7 @@ int main(int argc, char* argv[]){
             << "/10ms 退避=" << retryIntervalMs << "ms 重试上限=" << retryMax << std::endl;
   std::cout << "  星历误差σ=" << ephemErrS << "s 选星权重 wEl=" << wEl
             << " 迟滞=" << hoHyst << " 种子=" << rngSeed
-            << " 生存优先=" << (priorityOn ? "开" : "关") << std::endl;
+            << " 生存优先=" << (priorityOn ? "开" : "关") << " 模式=" << g_priorityMode << std::endl;
 
   // 读终端
   std::map<uint32_t, Ecef> termPosTmp;
@@ -1145,6 +1300,15 @@ int main(int argc, char* argv[]){
   std::cout << "  [DBG] AttemptAccess调用=" << g_dbg_attempt << " REQ发送=" << g_dbg_req
             << " 伪造拦截=" << g_dbg_forged_blocked << " 碰撞重试超限失败=" << g_dbg_collision_fail
             << " 漏检(密钥泄露)=" << g_dbg_forged_missed
-            << " 确认失败=" << g_dbg_confirm_fail << std::endl;
+            << " 确认失败=" << g_dbg_confirm_fail << " 重连回退(RACH)=" << g_dbg_rerach << std::endl;
+  if (g_priorityMode == "dp"){
+    double avgGh = (g_dpNGuard > 0) ? (g_dpSumGh / (double)g_dpNGuard) : 0.0;
+    uint64_t reclaim = 0; for (auto& kv : g_dpReclaim) reclaim += kv.second;
+    std::cout << "  [DP] 科学版自适应阈值：平均预留 g_h=" << std::fixed << std::setprecision(2) << avgGh
+              << " 阈值重算次数=" << g_dpNGuard
+              << " 闲置预留回收(med/low 复用高危区)=" << reclaim
+              << " ε(QoS上界)=" << std::setprecision(2) << g_prioEps
+              << " 负载标定=" << std::setprecision(2) << g_prioLoadCal << std::endl;
+  }
   return 0;
 }

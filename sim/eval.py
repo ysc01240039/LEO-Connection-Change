@@ -16,6 +16,7 @@
 - 接入时延：端到端 = (GRANT 完成时刻 − 首次发起时刻)，含退避/等待与握手全程，仅计成功事件。
 """
 import statistics as st
+from .config import PRIO_WEIGHTS
 
 
 def _f(x):
@@ -73,6 +74,13 @@ def compute_metrics(trace: list, summary: dict | None = None) -> dict:
         eb = [_f(e.get("ebno_db", 0)) for e in ho if _f(e.get("ebno_db", 0)) != 0.0]
         if eb:
             m["切换目标星EbN0均值_dB"] = round(sum(eb) / len(eb), 2)
+        # ---- D3 认证上下文预迁移量化 ----
+        if summary:
+            m["切换总时延均值_ms"] = round(summary.get("ho_total_ms_sum", 0.0) / nh, 2)
+            m["切换重连额外时延_ms"] = round(summary.get("rerach_extra_ms", 0.0) / nh, 2)
+            tot = summary.get("n_premig_hit", 0) + summary.get("n_premig_miss", 0)
+            if tot:
+                m["预迁移命中率"] = round(summary.get("n_premig_hit", 0) / tot, 4)
 
     # ---- T4 认证：可证伪指标（★审计修复★）----
     if forged:
@@ -102,6 +110,21 @@ def compute_metrics(trace: list, summary: dict | None = None) -> dict:
 
     # ---- ② 生存优先分级调度：按 tier 的成功率/时延/拒绝数（★计划书「温度」创新点★）----
     m.update(tier_metrics(trace))
+
+    # ---- 科学版 dp 调度指标：加权阻塞率 + 高危预留回收 ----
+    ms = m.get("med危终端接入成功率")
+    ls = m.get("low危终端接入成功率")
+    if ms is not None and ls is not None:
+        bm, bl = 1.0 - ms, 1.0 - ls
+        wm, wl = PRIO_WEIGHTS[0], PRIO_WEIGHTS[1]
+        m["加权阻塞率(中低危)"] = round((wm * bm + wl * bl) / (wm + wl), 4)
+    if summary:
+        if summary.get("dp_reclaim_total"):
+            m["高危预留回收次数"] = summary["dp_reclaim_total"]
+        if "dp_avg_gh" in summary:
+            m["dp平均高危预留"] = summary["dp_avg_gh"]
+        if summary.get("dp_eps") is not None:
+            m["dp高危QoS上界"] = summary["dp_eps"]
     return m
 
 
@@ -133,13 +156,20 @@ def tier_metrics(trace: list) -> dict:
 def rel17_improvement(base: dict, prop: dict) -> dict:
     """计算本方案相对 Rel-17 基线的提升%（★计划书 §4.1/§十二 量化要求★）。
 
-    比较项：(指标, 方向)；方向=降低 → (基线−方案)/基线×100（越大越好）；
-    方向=提升 → 同理（成功率越高越好）；方向=持平 → 认证拦截率与接入范式无关，标「持平」。
+    比较项：(指标, 方向)；提升% 含义统一为「方案相对基线变好多少，正值=方案更优」：
+    · 方向=降低（时延/中断/乒乓）：方案越低越好 → (基线−方案)/基线×100；
+    · 方向=提升（成功率）：方案越高越好 → (方案−基线)/基线×100；
+    · 方向=持平（认证拦截率，与接入范式无关）：标「持平」。
     基线为 0（如中断基线恰为 0）时无法算相对值，标「—」。
+
+    ★ 修复 2026-09-02（第 3 轮）★：原实现对所有方向统一用 (基线−方案)/基线，
+    导致「提升」类指标符号反转——方案成功率越高结果越负，把损失伪装成收益
+    （如 storm2 真实为 −23.4%，旧公式错显 +23.4%）。现按方向分别取符号。
     """
     spec = [
         ("接入时延均值_ms", "降低"),
         ("接入成功率", "提升"),
+        ("high危终端接入成功率", "提升"),
         ("切换中断均值_ms", "降低"),
         ("乒乓切换率", "降低"),
         ("伪造终端拦截率", "持平"),
@@ -153,10 +183,13 @@ def rel17_improvement(base: dict, prop: dict) -> dict:
         if direction == "持平":
             out[k] = "持平"
             continue
-        if isinstance(b, (int, float)) and b == 0:
+        if not isinstance(b, (int, float)) or b == 0:
             out[k] = "—"
             continue
-        out[k] = round((b - p) / b * 100, 1)
+        if direction == "提升":
+            out[k] = round((p - b) / b * 100, 1)
+        else:
+            out[k] = round((b - p) / b * 100, 1)
     return out
 
 

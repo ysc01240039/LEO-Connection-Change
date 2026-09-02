@@ -8,5 +8,6 @@
   L5 viz          -> viz.py        （后续换 Web/Three.js）
 
 每个文件顶部标注 REPLACEABLE / SWAP POINT，便于单独替换或扩展，不影响其他层。
-数据来自真实抓取/真实计算；设备/协议层参数为 config.py 与 channel.py 中的显式建模假设（已建常量溯源表，可审计）。
+数据来自真实抓取/真实计算；设备/协议层参数为 config.py 与 channel.py 中的显式建模假设
+（常量溯源表内嵌于 HTML 报告，可审计）。
 """

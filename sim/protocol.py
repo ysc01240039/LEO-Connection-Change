@@ -35,23 +35,29 @@
 
 【修复 6】接入 L2 信道：仰角 → 斜距 → Eb/N0 → BER → MAC 误码 → 合法终端被误拒（虚警率）。
     使「仰角代价」从记账数字变为有后果的量（低仰角 31° 相对天底误码恶化约 2.7 万倍）。
+
+★ 审计修复（2026-09-02，第 2 轮）★：重叠分支建链时刻原取预测 LOS（start_connect=los_pred），
+    ho_lead 提前量被完全旁路——预测式与反应式的切换中断几乎相同（实测 1854 vs 1863 ms）。
+    现重叠候选在决策时刻 t_ho 即刻建链（先建后断），新链可用 = 目标可达时刻 + 重连确认时长，
+    提前量真正进入中断通路。ns-3 轨（leo_access.cc DoHandover）已同步镜像。
 """
 import datetime as _dt
 import heapq
-import math
 import random
 
 import numpy as np
 from skyfield.api import EarthSatellite, wgs84
 
 from . import auth as _auth
-from .channel import ebno_db, mac_fail_prob, propagation_delay_s
+from . import prio_opt as _prio
+from .channel import ebno_db, mac_fail_prob
 from .config import (SIM_START_UTC, CARRIER_FREQ_HZ, SPEED_OF_LIGHT, MASK_ANGLE_DEG,
-                     ACCESS_PROC_MS, HO_LEAD_S, ACCESS_PROC_MS as _AP,
+                     ACCESS_PROC_MS, HO_LEAD_S,
                      RAR_WINDOW_MS, CONTENTION_TIMER_MS, N_PREAMBLE, EPHEM_ERR_S,
                      HO_W_EL, HO_W_DWELL, PINGPONG_WINDOW_S, PINGPONG_MIN_GAP_S,
                      LINK_MODEL_ON, BIT_RATE_BPS, AUTH_CPU_DERATE, AUTH_MAC_BYTES,
-                     PRIORITY_RESERVE_FRAC, PRIO_BACKOFF, TIER_ORDER)
+                     PRIORITY_RESERVE_FRAC, PRIO_BACKOFF, TIER_ORDER,
+                     PRIO_ADAPT_WIN_S, PRIO_EPS, PRIO_BETA, PRIO_WEIGHTS, PRIO_LOAD_CAL)
 
 C_KM_S = SPEED_OF_LIGHT / 1000.0  # 299792.458 km/s
 MAX_DWELL_S = 600.0               # 驻留归一化基准（LEO 25° 掩角典型过境时长）
@@ -80,12 +86,16 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
              link_model_on=LINK_MODEL_ON,
              compromised_share=scenario.get("compromised_share", 0.15),
              priority_on=scenario.get("priority_on", True),
+             pre_migrate=scenario.get("pre_migrate", True),
+             priority_mode=scenario.get("priority_mode", "static"),
              auth_extra_ms=None)
     if params:
         # 命令行短名 → 内部参数名（★审计修复★：原直接 update，短名 key 不匹配导致
         # --ephem-err / --ho-lead / --hyst / --compromised 静默失效）
         alias = {"ho_lead": "ho_lead_s", "ephem_err": "ephem_err_s", "hyst": "ho_hyst",
-                 "compromised": "compromised_share", "priority": "priority_on"}
+                 "compromised": "compromised_share", "priority": "priority_on",
+                 "prio_mode": "priority_mode", "priority_mode": "priority_mode",
+                 "pre_migrate": "pre_migrate", "premigrate": "pre_migrate"}
         norm = {alias.get(k, k): v for k, v in params.items()}
         P.update({k: v for k, v in norm.items() if v is not None})
 
@@ -108,6 +118,10 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
     auth_extra_ms = P["auth_extra_ms"]
     if auth_extra_ms is None:
         auth_extra_ms = _auth.measure_verify_ms() * AUTH_CPU_DERATE
+    # D3：每星独立认证上下文 {sat: {pseudo: counter}}，是「认证上下文星间预迁移」的状态载体。
+    # 当前 onboard 为全局共享校验器（任一星均可从 root_key 推导 dev_key），故预迁移此前被隐式满足、
+    # 无独立建模；引入本表后，预迁移 = 将上下文推送到候选星，无预迁移则新星须重新 RACH。
+    sat_ctx = {}
 
     t0 = _dt.datetime.fromisoformat(SIM_START_UTC.replace("Z", "+00:00"))
     observer = wgs84.latlon(scenario["lat"], scenario["lon"], scenario["alt_m"])
@@ -183,11 +197,37 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
     _load_p = [{}, {}, {}]  # 三档专用池 (sat, 时隙) -> 已受理数；pool id = prio(0=high/1=med/2=low)
     _preamble = {}    # (sat, 时隙, 前导) -> 首个占用终端（四步竞争）
 
+    # ---- 科学版 dp 调度状态（priority_mode=="dp" 时使用）----
+    # 模型：每 (sat, 10ms 时隙) 总占用；guard-channel 准入（见 sim/prio_opt.py）。
+    _dp_occ = {}       # (sat, slot) -> 总占用数（dp 模式）
+    _dp_ewma = {}      # (sat, tier) -> 各档到达率 λ 的 EWMA（每窗口更新）
+    _dp_wincnt = {}    # (sat, tier) -> 当前窗口到达计数
+    _dp_win = {}       # sat -> 当前窗口索引
+    _dp_guards = {}    # sat -> (g_h, g_m) 当前最优阈值
+    _dp_slot_per_win = max(1, int(PRIO_ADAPT_WIN_S / 0.01))
+    _dp_def_gh = max(1, int(rach_capacity * PRIORITY_RESERVE_FRAC[0]))
+    _dp_def_gm = max(1, int(rach_capacity * PRIORITY_RESERVE_FRAC[1]))
+    _dp_reclaim = {}   # sat -> med/low 占用高危预留区的回收次数
+    _dp_sum_gh = 0.0   # 跨窗口 g_h 累加（报告平均预留）
+    _dp_n_guard = 0    # 阈值重算次数
+
+    def _dp_recompute(sat):
+        """结算上一窗口：更新 EWMA，解最优阈值，写入 _dp_guards。"""
+        nonlocal _dp_sum_gh, _dp_n_guard
+        ah = _dp_ewma.get((sat, 0), 0.0) * PRIO_LOAD_CAL
+        am = _dp_ewma.get((sat, 1), 0.0) * PRIO_LOAD_CAL
+        al = _dp_ewma.get((sat, 2), 0.0) * PRIO_LOAD_CAL
+        (gh, gm), _ = _prio.optimal_guards(rach_capacity, ah, am, al,
+                                           wm=PRIO_WEIGHTS[0], wl=PRIO_WEIGHTS[1], eps=PRIO_EPS)
+        _dp_guards[sat] = (gh, gm)
+        _dp_sum_gh += gh
+        _dp_n_guard += 1
+
     def _slot_ok(t, sat, prio):
-        """优先级感知 RACH 容量判定（★生存优先调度·三池版★）。
+        """优先级感知 RACH 容量判定（★生存优先调度★）。
         priority_on=False：所有 tier 共用单池（无优先级基线）。
-        priority_on=True：high/med/low 各占专用预留池（比例见 PRIORITY_RESERVE_FRAC），
-                          严格隔离 → high>med>low 单调成立（不再 med<low 假象）。
+        priority_on=True & priority_mode="dp"：guard-channel 最优阈值（在线自适应，推荐科学版）。
+        priority_on=True & priority_mode="static"：high/med/low 固定比例三池（答辩可复现基线）。
         """
         if not collision_on:
             return True
@@ -198,13 +238,44 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                 return False
             _load[key] = n + 1
             return True
+        if P["priority_mode"] == "dp":
+            # --- 窗口推进：结算上一窗口并重算最优阈值 ---
+            slot = int(t / 0.01)
+            win = int(t / PRIO_ADAPT_WIN_S)
+            sat_win = _dp_win.get(sat)
+            if sat_win is None or win != sat_win:
+                if sat_win is not None:
+                    for tier in (0, 1, 2):
+                        raw = _dp_wincnt.get((sat, tier), 0) / _dp_slot_per_win
+                        prev = _dp_ewma.get((sat, tier))
+                        _dp_ewma[(sat, tier)] = (raw if prev is None
+                                                else PRIO_BETA * raw + (1 - PRIO_BETA) * prev)
+                    _dp_recompute(sat)
+                _dp_win[sat] = win
+                for tier in (0, 1, 2):
+                    _dp_wincnt[(sat, tier)] = 0
+            # --- guard-channel 准入（窗口/到达计数在事件循环按「首次尝试」更新）---
+            gh, gm = _dp_guards.get(sat, (_dp_def_gh, _dp_def_gm))
+            occ = _dp_occ.get((sat, slot), 0)
+            if prio == 0:
+                ok = occ < rach_capacity
+            elif prio == 1:
+                ok = occ < rach_capacity - gh
+            else:
+                ok = occ < rach_capacity - gh - gm
+            if ok:
+                _dp_occ[(sat, slot)] = occ + 1
+                # 回收计数：med/low 落入高危预留区 [c-gh, c) → 闲置预留被复用
+                if prio != 0 and occ >= rach_capacity - gh:
+                    _dp_reclaim[sat] = _dp_reclaim.get(sat, 0) + 1
+                return True
+            return False
+        # --- static：固定比例三池 ---
         slot = int(t / 0.01)
-        # 三档专用池容量（余数归 low，保证总容量=rach_capacity 不丢吞吐）
         cap = [max(1, int(rach_capacity * PRIORITY_RESERVE_FRAC[p])) for p in range(3)]
         cap[2] = rach_capacity - cap[0] - cap[1]
         if cap[2] < 1:
             cap[2] = 1
-        # 严格三池：先占本档专用池；不向低优档借用（借用会重演 med<low，故关闭）
         for p in range(prio, 3):
             key = (sat, slot, p)
             if _load_p[p].get(key, 0) < cap[p]:
@@ -261,6 +332,12 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
     n_forged = n_forged_blocked = n_forged_missed = 0
     n_false_reject = 0
     n_confirm_fail = 0
+    n_premig_hit = 0          # D3：切换时新星已持预迁移上下文（RACH-less 一次比对）
+    n_premig_miss = 0         # D3：切换时新星无上下文（须重新 RACH）
+    n_rerach = 0
+    n_rerach_fail = 0
+    rerach_extra_ms = 0.0
+    ho_total_ms_sum = 0.0     # D3：切换总时延累加（每次切换 exec_s，含预迁移/RACH 差异）
 
     for k, tag, prio, arr0 in first_pass:
         is_forged = rng.random() < forged_ratio
@@ -294,6 +371,9 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             continue
         dop, slant, d_ms = g
 
+        # ---- 科学版 dp：仅「首次尝试」计入 offered load（重试是阻塞后果，不喂模型）----
+        if P.get("priority_mode") == "dp" and term_attempts[k] == 0:
+            _dp_wincnt[(best["sat"], prio)] = _dp_wincnt.get((best["sat"], prio), 0) + 1
         if not _slot_ok(t, best["sat"], prio):
             if term_attempts[k] >= retry_max:
                 term_failed.add(k)
@@ -328,6 +408,7 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                 trace.append(_mk("ACCESS", k, tag, t, best["sat"], best["sat"], value_ms,
                                  dop, slant, "success", forged=True,
                                  auth_result="ok_missed", ebno=_link_ebno(slant)))
+                sat_ctx.setdefault(best["sat"], {})[ps] = term_attempts[k] + 1  # D3
                 continue
             n_forged_blocked += 1
             term_failed.add(k)
@@ -375,6 +456,7 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
         grant_t = t + handshake / 1000.0
         trace.append(_mk("ACCESS", k, tag, grant_t, best["sat"], best["sat"], value_ms,
                          dop, slant, "success", auth_result=res, ebno=_link_ebno(slant)))
+        sat_ctx.setdefault(best["sat"], {})[ps] = term_attempts[k] + 1  # D3：服务星记录终端认证上下文
         connect_sat, connect_t = best["sat"], grant_t
 
         # ---------------- 预测式切换 ----------------
@@ -408,27 +490,60 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                 cur_score = _score(cur, t_ho)
                 if P["ho_hyst"] > 0 and _score(cand, t_ho) < cur_score + P["ho_hyst"]:
                     break     # 迟滞：不切换，保持当前连接至结束
-                start_connect = los_pred
+                # ★审计修复 2026-09-02（第 2 轮）★：重叠候选在决策时刻 t_ho 已可见，
+                # 预测式「先建后断」应即刻执行建链（可连时刻 = t_ho），而非等到预测 LOS。
+                # 原 start_connect=los_pred 使 ho_lead 提前量被完全旁路：
+                # 中断 ≈ max(0, LOS 预测高估误差)，与反应式切换无差别，提前 20s 形同虚设。
+                start_connect = t_ho
             elif nxt is not None:
                 cand = nxt
-                start_connect = nxt["aos_s"]
+                start_connect = nxt["aos_s"]      # 覆盖盲区：等待目标星升起后才可连
             else:
                 break
+
+            # ---- D3 认证上下文星间预迁移（先建后断）----
+            # 服务星在决策时刻 t_ho 将本终端认证上下文（pseudo + 当前计数器）经星间链路
+            # 提前打包迁移至预测目标星；切换时新星凭预置上下文一次比对即确认（RACH-less）。
+            # 若 pre_migrate 关闭，或预测失配导致实际目标星 ≠ 迁移目标星，则新星无上下文 → 回退重新 RACH。
+            pk = _auth.make_pseudo(root_key, k)
+            if P["pre_migrate"]:
+                sat_ctx.setdefault(cand["sat"], {})[pk] = \
+                    sat_ctx.get(cur["sat"], {}).get(pk, term_attempts[k] + 1)
+            has_ctx = pk in sat_ctx.get(cand["sat"], {})
+
             if cand["los_s"] <= los_pred + 1e-9:
                 break
 
             # 中断 = max(0, 新链可用 − 旧链真实丢失)
             # ★单位：t_ho/start_connect 为秒，ho_d_ms/access_proc_ms/auth_extra_ms 为毫秒★
+            # ★审计修复 2026-09-02（第 2 轮）★：重连确认须在目标可达（start_connect）之后
+            # 才能收发，故新链可用 = start_connect + exec_s（原从 t_ho 起算取 max，
+            # 对盲区兜底分支低估一个执行时长，对重叠分支则高估可用时刻）。
             gc = _geom(cand["sat"], t_ho)
             ho_d_ms = gc[2] if gc else d_ms
             ho_dop = gc[0] if gc else 0.0
             ho_slant = gc[1] if gc else 0.0
             exec_s = (2.0 * ho_d_ms + access_proc_ms + auth_extra_ms) / 1000.0
-            confirm_t = t_ho + exec_s
-            avail = max(start_connect, confirm_t)
+            if not has_ctx:
+                # 无预迁移：终端须在新星重新随机接入（完整接入流程），含前导竞争与附加调度时延
+                rerach = step4_extra_ms(ho_d_ms)
+                extra_rerach = (2.0 * ho_d_ms + access_proc_ms + rerach) / 1000.0
+                if not _preamble_contend(t, cand["sat"], k):
+                    n_rerach_fail += 1
+                    extra_rerach += (2.0 * ho_d_ms + access_proc_ms) / 1000.0  # 竞争失败退避一轮
+                else:
+                    n_rerach += 1
+                exec_s += extra_rerach
+                rerach_extra_ms += extra_rerach * 1000.0
+                n_premig_miss += 1
+            else:
+                n_premig_hit += 1
+            avail = start_connect + exec_s
+            ho_total_ms_sum += exec_s * 1000.0   # D3：切换总时延累加
             interrupt = max(0.0, avail - los_true)     # ← 真实 LOS，非预测 LOS
-            if interrupt == 0.0 and start_connect < los_true:
-                early_waste += los_true - start_connect     # 提前切换浪费的驻留
+            if interrupt == 0.0 and avail < los_true:
+                # 先建后断的双链并持时长（新链就绪早于旧链丢失的余量）
+                early_waste += los_true - avail
 
             # ---- T7 重连确认：目标星一次比对令牌（★仰角代价兑现为中断的通路★）----
             # 低仰角目标星 → 斜距大 → Eb/N0 低 → BER 高 → 令牌被误码破坏 → 确认失败
@@ -468,5 +583,16 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                "n_forged_missed": n_forged_missed, "n_false_reject": n_false_reject,
                "n_confirm_fail": n_confirm_fail, "early_waste_s": round(early_waste, 1),
                "auth_extra_ms": round(auth_extra_ms, 6),
+               "n_premig_hit": n_premig_hit, "n_premig_miss": n_premig_miss,
+               "n_rerach": n_rerach, "n_rerach_fail": n_rerach_fail,
+               "rerach_extra_ms": round(rerach_extra_ms, 1),
+               "ho_total_ms_sum": round(ho_total_ms_sum, 1),
+               "pre_migrate": P["pre_migrate"],
                "geom_fail": geom_fail["n"], "params": dict(P)}
+    # ---- 科学版 dp 调度计数（priority_mode=="dp" 时有效）----
+    if P.get("priority_mode") == "dp":
+        summary["dp_avg_gh"] = round(_dp_sum_gh / _dp_n_guard, 2) if _dp_n_guard else 0.0
+        summary["dp_n_guard_updates"] = _dp_n_guard
+        summary["dp_reclaim_total"] = sum(_dp_reclaim.values())
+        summary["dp_eps"] = PRIO_EPS
     return trace, summary

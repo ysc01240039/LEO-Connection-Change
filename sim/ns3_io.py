@@ -12,14 +12,13 @@ import json
 import math
 import random
 from datetime import datetime, timedelta
-from pathlib import Path
 import numpy as np
 
 from .config import DATA_DIR, SIM_START_UTC, TIME_STEP_S
 from .scenario import get_scenario
 from .data_sources import fetch_tle
 from .orbit import build_timescale
-from skyfield.api import EarthSatellite, wgs84
+from skyfield.api import EarthSatellite
 
 NS3_IN = DATA_DIR / "ns3_in"
 NS3_OUT = DATA_DIR / "ns3_out"
@@ -91,8 +90,11 @@ def gen_terminals(sc, out_csv, seed=42):
     spread = sc.get("spread_deg", 0.6)
     n = sc["terminals"]
     # 危险度分层（与 Note.txt/Text.txt 一致：指挥/灾情/报平安）
+    # ★一致性修复（2026-09-02 第 2 轮）★：权重改读场景配置 danger_tags，
+    # 原为硬编码 [0.2, 0.35, 0.45] 与 sim/scenario.py 双处维护，存在漂移风险。
+    danger = sc.get("danger_tags", {"high": 0.20, "med": 0.35, "low": 0.45})
     tags = ["high", "med", "low"]
-    weights = [0.2, 0.35, 0.45]
+    weights = [danger["high"], danger["med"], danger["low"]]
     terms = []
     for i in range(n):
         dlat = rnd.uniform(-spread, spread)
@@ -125,11 +127,14 @@ def write_ns3_scenario(sc, prov, params, out_json):
         "ho_lead_s": params["ho_lead_s"],
         "tick_s": params["tick_s"],
         "carrier_hz": params["carrier_hz"],
-        # ---- T4 / RACH / 碰撞（与 scenario.py 及 leo_access.cc 同参）----
+        # ---- T4 / RACH / 碰撞（与 scenario.py 及 leo_access.cc 同参；ns-3 实际
+        #      消费的参数由 run_ns3.py 命令行显式透传，此处为溯源快照）----
         "forged_ratio": sc.get("forged_ratio", 0.0),
-        "auth_extra_ms": sc.get("auth_extra_ms", 0.0),
+        # ★一致性修复（2026-09-02 第 2 轮）★：auth_extra_ms 为本机 HMAC 实测折算值
+        # （run_ns3.py 计算并透传）；step4_extra_ms 已删除（四步附加时延改为
+        # RAR 窗口+竞争解决定时器+几何往返实算，见 sim/protocol.py 四步建模）。
+        "auth_extra_ms": params.get("auth_extra_ms", 0.0),
         "rach_steps": sc.get("rach_steps", 2),
-        "step4_extra_ms": sc.get("step4_extra_ms", 400.0),
         "collision_on": sc.get("collision_on", False),
         "rach_capacity": sc.get("rach_capacity", 64),
         "retry_interval_ms": sc.get("retry_interval_ms", 500.0),
@@ -145,9 +150,12 @@ def write_ns3_scenario(sc, prov, params, out_json):
 
 
 # ----------------- 回采：解析 ns-3 真实 trace -----------------
+# ★一致性修复（2026-09-02 第 2 轮）★：补齐至 16 列（auth_result、ebno_db 为
+# 第一轮审计新增字段，leo_access.cc 与 sim/interfaces.py TRACE_COLS 均为 16 列）。
 TRACE_FIELDS = ["event_type", "terminal", "tag", "t_s", "serving_sat",
                 "target_sat", "value_ms", "doppler_hz", "slant_km",
-                "result", "predict_mismatch", "pingpong", "ho_el_cost_deg", "forged"]
+                "result", "predict_mismatch", "pingpong", "ho_el_cost_deg", "forged",
+                "auth_result", "ebno_db"]
 
 
 def parse_ns3_trace(out_csv):
