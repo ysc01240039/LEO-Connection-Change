@@ -48,7 +48,9 @@ def derive_dev_key(root_key: bytes, term_id: int) -> bytes:
 
 
 def make_pseudo(root_key: bytes, term_id: int) -> bytes:
-    """假名标识（对外不暴露 dev_id，支持切换时轮换）。"""
+    """假名标识（★P0-3 口径收敛★：假名由根密钥派生、确定性生成，用于在信令中
+    替代明文长期身份；接入凭证携带一次性令牌（单调计数器）防重放。当前为固定假名，
+    「每次接入轮换防跟踪」属未来工作，不在本仿真实现范围内——如实标注，勿宣称）。"""
     return hmac.new(root_key, b"pseudo" + str(int(term_id)).encode(),
                     hashlib.sha256).digest()[:AUTH_PSEUDO_BYTES]
 

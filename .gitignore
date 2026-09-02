@@ -29,3 +29,6 @@ data/sim/perf_scale.py
 
 # Python 性能剖析二进制（不入库）
 *.prof
+
+# 调试/反汇编残留（不入库）
+dbg_*.txt

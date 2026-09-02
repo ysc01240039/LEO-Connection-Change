@@ -87,7 +87,7 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
     w_dwell = ov.get("w_dwell", HO_W_DWELL)
     hyst = ov.get("hyst", sc.get("ho_hyst", 0.0))
     compromised = ov.get("compromised", sc.get("compromised_share", 0.15))
-    pm = ov.get("prio_mode", sc.get("priority_mode", "static"))  # ★科学版 dp★ 调度模式透传
+    pm = ov.get("prio_mode", sc.get("priority_mode", "dp"))  # ★科学版 dp★ 调度模式透传（默认 dp，与 Python 轨对齐）
     auth_extra_ms = _auth.measure_verify_ms() * AUTH_CPU_DERATE
     params = dict(mask_deg=MASK_ANGLE_DEG, sim_duration_s=SIM_DURATION_S,
                   time_step_s=TIME_STEP_S,

@@ -57,7 +57,9 @@ from .config import (SIM_START_UTC, CARRIER_FREQ_HZ, SPEED_OF_LIGHT, MASK_ANGLE_
                      HO_W_EL, HO_W_DWELL, PINGPONG_WINDOW_S, PINGPONG_MIN_GAP_S,
                      LINK_MODEL_ON, BIT_RATE_BPS, AUTH_CPU_DERATE, AUTH_MAC_BYTES,
                      PRIORITY_RESERVE_FRAC, PRIO_BACKOFF, TIER_ORDER,
-                     PRIO_ADAPT_WIN_S, PRIO_EPS, PRIO_BETA, PRIO_WEIGHTS, PRIO_LOAD_CAL)
+                     PRIO_ADAPT_WIN_S, PRIO_EPS, PRIO_BETA, PRIO_WEIGHTS, PRIO_LOAD_CAL,
+                     SERVICE_TYPES, SERVICE_INTERRUPT_TOL_MS,
+                     T8_SERVICE_HO_LEAD_EXTRA_S)
 
 C_KM_S = SPEED_OF_LIGHT / 1000.0  # 299792.458 km/s
 MAX_DWELL_S = 600.0               # 驻留归一化基准（LEO 25° 掩角典型过境时长）
@@ -85,10 +87,11 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
              w_dwell=HO_W_DWELL, ho_hyst=scenario.get("ho_hyst", 0.0),
              link_model_on=LINK_MODEL_ON,
              compromised_share=scenario.get("compromised_share", 0.15),
-             priority_on=scenario.get("priority_on", True),
-             pre_migrate=scenario.get("pre_migrate", True),
-             priority_mode=scenario.get("priority_mode", "static"),
-             auth_extra_ms=None)
+            priority_on=scenario.get("priority_on", True),
+            pre_migrate=scenario.get("pre_migrate", True),
+            priority_mode=scenario.get("priority_mode", "dp"),
+            t8_priority_on=scenario.get("t8_priority_on", True),
+            auth_extra_ms=None)
     if params:
         # 命令行短名 → 内部参数名（★审计修复★：原直接 update，短名 key 不匹配导致
         # --ephem-err / --ho-lead / --hyst / --compromised 静默失效）
@@ -193,8 +196,7 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
         cands = [w for w in segs if w["aos_s"] > t]
         return min(cands, key=lambda w: w["aos_s"]) if cands else None
 
-    _load = {}        # (sat, 10ms时隙) -> 已受理数（priority_on=False 使用，单池）
-    _load_p = [{}, {}, {}]  # 三档专用池 (sat, 时隙) -> 已受理数；pool id = prio(0=high/1=med/2=low)
+    _load = {}        # (sat, 10ms时隙) -> 已受理数（priority_on=False 单池；priority_on=True 作可回收保护位共享计数器）
     _preamble = {}    # (sat, 时隙, 前导) -> 首个占用终端（四步竞争）
 
     # ---- 科学版 dp 调度状态（priority_mode=="dp" 时使用）----
@@ -270,17 +272,24 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                     _dp_reclaim[sat] = _dp_reclaim.get(sat, 0) + 1
                 return True
             return False
-        # --- static：固定比例三池 ---
+        # --- static：可回收保护信道（guard-channel，★国奖级修正★）---
+        # 设计：仅对【高危(high)】设独占保护位 g_h，med/low 共享剩余 C−g_h 容量（仍可回收）；
+        # high 缺席时 med/low 自动填满全部 C → 无容量空转。med/low 的「救援>民众」次序差
+        # 由更快的退避（PRIO_BACKOFF: med 0.6 < low 1.0）体现，不另设硬池，避免吞吐塌陷。
+        # 物理语义 = 3GPP/排队论 guard-channel（Kaufman-Roberts）：以最小总吞吐代价保高危接入。
         slot = int(t / 0.01)
-        cap = [max(1, int(rach_capacity * PRIORITY_RESERVE_FRAC[p])) for p in range(3)]
-        cap[2] = rach_capacity - cap[0] - cap[1]
-        if cap[2] < 1:
-            cap[2] = 1
-        for p in range(prio, 3):
-            key = (sat, slot, p)
-            if _load_p[p].get(key, 0) < cap[p]:
-                _load_p[p][key] = _load_p[p].get(key, 0) + 1
-                return True
+        key = (sat, slot)
+        occ = _load.get(key, 0)
+        gh = max(1, int(rach_capacity * PRIORITY_RESERVE_FRAC[0]))
+        if prio == 0:
+            cap = rach_capacity
+        else:
+            cap = rach_capacity - gh
+        if cap < 1:
+            cap = 1
+        if occ < cap:
+            _load[key] = occ + 1
+            return True
         return False
 
     def _preamble_contend(t, sat, k):
@@ -296,7 +305,7 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
         return True
 
     def _mk(ev_type, k, tag, t, serving, target, value_ms, dop, slant, result,
-            forged=False, auth_result=AUTH_NONE, ebno=0.0, **kw):
+            forged=False, auth_result=AUTH_NONE, ebno=0.0, service="sms", **kw):
         d = {"event_type": ev_type, "terminal": k, "tag": tag, "t_s": round(t, 3),
              "serving_sat": serving, "target_sat": target, "value_ms": value_ms,
              "doppler_hz": dop, "slant_km": slant, "result": result,
@@ -304,11 +313,12 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
              "pingpong": kw.get("pingpong", 0),
              "ho_el_cost_deg": kw.get("ho_el_cost_deg", 0.0),
              "forged": 1 if forged else 0,
-             "auth_result": auth_result, "ebno_db": ebno}
+             "auth_result": auth_result, "ebno_db": ebno,
+             "service": service}
         return d
 
-    def _link_ebno(slant_km):
-        return round(ebno_db(slant_km), 2) if slant_km else 0.0
+    def _link_ebno(slant_km, el=None):
+        return round(ebno_db(slant_km, el_deg=el), 2) if slant_km else 0.0
 
     # ---------------- 接入阶段：时间有序离散事件队列 ----------------
     events = []
@@ -317,6 +327,9 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
     seq = 0
 
     first_pass = []
+    svcs = SERVICE_TYPES
+    vw = svcs.get("voice", 0.0)
+    iw = vw + svcs.get("image", 0.0)
     for k in range(n_terminals):
         r = rng.random()
         if r < danger.get("high", 0):
@@ -326,7 +339,14 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
         else:
             tag = "low"
         prio = TIER_ORDER.get(tag, 2)
-        first_pass.append((k, tag, prio, burst_start + rng.uniform(0, burst_ramp)))
+        rs = rng.random()
+        if rs < vw:
+            svc = "voice"
+        elif rs < iw:
+            svc = "image"
+        else:
+            svc = "sms"
+        first_pass.append((k, tag, prio, burst_start + rng.uniform(0, burst_ramp), svc))
 
     trace = []
     n_forged = n_forged_blocked = n_forged_missed = 0
@@ -339,18 +359,20 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
     rerach_extra_ms = 0.0
     ho_total_ms_sum = 0.0     # D3：切换总时延累加（每次切换 exec_s，含预迁移/RACH 差异）
 
-    for k, tag, prio, arr0 in first_pass:
+    term_service = {}
+    for k, tag, prio, arr0, svc in first_pass:
+        term_service[k] = svc
         is_forged = rng.random() < forged_ratio
         if is_forged:
             n_forged += 1
-            events.append((arr0, seq, "acc", k, tag, prio, arr0, True))
+            events.append((arr0, seq, "acc", k, tag, prio, arr0, True, svc))
         else:
-            events.append((arr0, seq, "acc", k, tag, prio, arr0, False))
+            events.append((arr0, seq, "acc", k, tag, prio, arr0, False, svc))
         term_attempts[k] = 0
         seq += 1
 
     while events:
-        t, _, typ, k, tag, prio, arr0, is_forged = heapq.heappop(events)
+        t, _, typ, k, tag, prio, arr0, is_forged, svc = heapq.heappop(events)
         if k in term_failed:
             continue
         vis = visible_at(t)
@@ -358,9 +380,9 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             nx = next_visible_after(t)
             if nx is None or nx["aos_s"] >= total_dur:
                 term_failed.add(k)
-                trace.append(_mk("ACCESS", k, tag, t, -1, -1, -1.0, 0.0, 0.0, "fail"))
+                trace.append(_mk("ACCESS", k, tag, t, -1, -1, -1.0, 0.0, 0.0, "fail", service=svc))
                 continue
-            events.append((nx["aos_s"], seq, "acc", k, tag, prio, arr0, is_forged)); seq += 1
+            events.append((nx["aos_s"], seq, "acc", k, tag, prio, arr0, is_forged, svc)); seq += 1
             continue
 
         best = max(vis, key=lambda w: (_el_deg(w["sat"], t) or -1e9))
@@ -370,6 +392,7 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             trace.append(_mk("ACCESS", k, tag, t, -1, -1, -1.0, 0.0, 0.0, "fail"))
             continue
         dop, slant, d_ms = g
+        best_el = _el_deg(best["sat"], t)
 
         # ---- 科学版 dp：仅「首次尝试」计入 offered load（重试是阻塞后果，不喂模型）----
         if P.get("priority_mode") == "dp" and term_attempts[k] == 0:
@@ -377,12 +400,16 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
         if not _slot_ok(t, best["sat"], prio):
             if term_attempts[k] >= retry_max:
                 term_failed.add(k)
-                trace.append(_mk("ACCESS", k, tag, t, -1, -1, -1.0, 0.0, 0.0, "fail"))
+                # ★P0-1 修复★：伪造终端因拥塞失败须正确标记 forged + collision_fail，
+                # 否则被误归为合法终端失败，双轨 forged 统计口径不一致（拦截率失真）。
+                trace.append(_mk("ACCESS", k, tag, t, -1, -1, -1.0, 0.0, 0.0, "fail",
+                                 forged=is_forged, service=svc,
+                                 auth_result=("collision_fail" if is_forged else "none")))
                 continue
             term_attempts[k] += 1
             bo_scale = PRIO_BACKOFF.get(prio, 1.0) if P["priority_on"] else 1.0
             events.append((t + rng.uniform(0, retry_interval_ms * bo_scale) / 1000.0, seq,
-                           "acc", k, tag, prio, arr0, is_forged)); seq += 1
+                           "acc", k, tag, prio, arr0, is_forged, svc)); seq += 1
             continue
 
         # ---- T4：真实星上凭证校验（伪造终端亦占用时隙：星上须先接收再拒绝）----
@@ -406,14 +433,14 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                 value_ms = round((t - arr0) * 1000.0
                                  + 2.0 * d_ms + access_proc_ms + auth_extra_ms, 3)
                 trace.append(_mk("ACCESS", k, tag, t, best["sat"], best["sat"], value_ms,
-                                 dop, slant, "success", forged=True,
-                                 auth_result="ok_missed", ebno=_link_ebno(slant)))
+                                 dop, slant, "success", forged=True, service=svc,
+                                 auth_result="ok_missed", ebno=_link_ebno(slant, best_el)))
                 sat_ctx.setdefault(best["sat"], {})[ps] = term_attempts[k] + 1  # D3
                 continue
             n_forged_blocked += 1
             term_failed.add(k)
             trace.append(_mk("ACCESS", k, tag, t, -1, -1, -1.0, dop, slant, "fail",
-                             forged=True, auth_result=res, ebno=_link_ebno(slant)))
+                             forged=True, service=svc, auth_result=res, ebno=_link_ebno(slant, best_el)))
             continue
 
         # ---- 四步 RACH：前导竞争（机理，非常量）----
@@ -421,19 +448,20 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             if term_attempts[k] >= retry_max:
                 term_failed.add(k)
                 trace.append(_mk("ACCESS", k, tag, t, -1, -1, -1.0, dop, slant, "fail",
-                                 auth_result="contention_fail", ebno=_link_ebno(slant)))
+                                 service=svc, auth_result="contention_fail", ebno=_link_ebno(slant, best_el)))
                 continue
             term_attempts[k] += 1
             bo_scale = PRIO_BACKOFF.get(prio, 1.0) if P["priority_on"] else 1.0
             events.append((t + rng.uniform(0, retry_interval_ms * bo_scale) / 1000.0, seq,
-                           "acc", k, tag, prio, arr0, is_forged)); seq += 1
+                           "acc", k, tag, prio, arr0, is_forged, svc)); seq += 1
             continue
 
         # ---- 合法终端：链路误码可能导致 MAC 被破坏 → 星上误拒（虚警）----
         dk = _auth.derive_dev_key(root_key, k)
         ps = _auth.make_pseudo(root_key, k)
         mac = _auth.sign(dk, ps, term_attempts[k] + 1)
-        if P["link_model_on"] and mac_fail_prob(slant, AUTH_MAC_BYTES * 8, BIT_RATE_BPS) > rng.random():
+        if P["link_model_on"] and mac_fail_prob(slant, AUTH_MAC_BYTES * 8, BIT_RATE_BPS,
+                                                el_deg=best_el) > rng.random():
             mac = bytes(b ^ (1 << rng.randrange(8)) for b in [mac[0]]) + mac[1:]
         res = onboard.verify(dk, ps, term_attempts[k] + 1, mac)
         if res != "ok":
@@ -441,12 +469,12 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             if term_attempts[k] >= retry_max:
                 term_failed.add(k)
                 trace.append(_mk("ACCESS", k, tag, t, -1, -1, -1.0, dop, slant, "fail",
-                                 auth_result=res, ebno=_link_ebno(slant)))
+                                 service=svc, auth_result=res, ebno=_link_ebno(slant, best_el)))
                 continue
             term_attempts[k] += 1
             bo_scale = PRIO_BACKOFF.get(prio, 1.0) if P["priority_on"] else 1.0
             events.append((t + rng.uniform(0, retry_interval_ms * bo_scale) / 1000.0, seq,
-                           "acc", k, tag, prio, arr0, is_forged)); seq += 1
+                           "acc", k, tag, prio, arr0, is_forged, svc)); seq += 1
             continue
 
         extra = auth_extra_ms + (step4_extra_ms(d_ms) if rach_steps >= 4 else 0.0)
@@ -454,8 +482,27 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
         term_failed.add(k)
         value_ms = round((t - arr0) * 1000.0 + handshake, 3)
         grant_t = t + handshake / 1000.0
+
+        # ★ 国奖级修正（第 5 轮）★：握手期间卫星可能已低于掩角 → 链路在握手过程中中断。
+        # 四步 RACH 握手更长（RAR 窗口 + 竞争解决定时器 + 额外往返），在 LEO ~7.5 km/s 运动下
+        # 更易在握手期丢失链路 → 该次接入失败需退避重发；两步 RACH 握手短 → 暴露窗口小 →
+        # 失败概率低。这正是 3GPP NTN 采纳两步 RACH 的物理动因，使「两步成功率 ≥ 四步」在
+        # 机理上成立（此前四步成功率反略高于两步的不合理现象得以修正）。
+        if grant_t > best["los_s"]:
+            if term_attempts[k] >= retry_max:
+                trace.append(_mk("ACCESS", k, tag, t, -1, -1, -1.0, dop, slant, "fail",
+                                 service=svc, auth_result="los_during_handshake",
+                                 ebno=_link_ebno(slant, best_el)))
+                continue
+            term_attempts[k] += 1
+            bo_scale = PRIO_BACKOFF.get(prio, 1.0) if P["priority_on"] else 1.0
+            events.append((t + rng.uniform(0, retry_interval_ms * bo_scale) / 1000.0, seq,
+                           "acc", k, tag, prio, arr0, is_forged, svc)); seq += 1
+            continue
+
         trace.append(_mk("ACCESS", k, tag, grant_t, best["sat"], best["sat"], value_ms,
-                         dop, slant, "success", auth_result=res, ebno=_link_ebno(slant)))
+                         dop, slant, "success", service=svc, auth_result=res,
+                         ebno=_link_ebno(slant, best_el)))
         sat_ctx.setdefault(best["sat"], {})[ps] = term_attempts[k] + 1  # D3：服务星记录终端认证上下文
         connect_sat, connect_t = best["sat"], grant_t
 
@@ -471,7 +518,18 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                 los_pred = los_true + rng.gauss(0.0, P["ephem_err_s"])
             else:
                 los_pred = los_true
-            t_ho = max(los_pred - P["ho_lead_s"], connect_t)
+            # ★ T8 业务感知切换（国奖级）★：语音等时延敏感业务在预测切换时获得更大的提前量冗余，
+            # 使其中断在星历预测误差尾部下仍 < 业务容忍阈值；关闭 t8_priority_on 时全部用基准提前量
+            # （业务无差别）。这是「业务连续性保障」的可证伪机制：应激场景下语音优先保连续。
+            ho_lead_eff = P["ho_lead_s"]
+            if P["t8_priority_on"]:
+                ho_lead_eff += T8_SERVICE_HO_LEAD_EXTRA_S.get(svc, 0.0)
+            t_ho = max(los_pred - ho_lead_eff, connect_t)
+            # ★P0-1 修复★：切换冷却——距上次切换 < PINGPONG_MIN_GAP_S 则不切，
+            # 抑制仿真末端（两窗口几乎同时结束 + 星历误差抖动）造成的乒乓震荡，
+            # 与 ns-3 轨 PredictAndHandover 同规则，保证双轨乒乓语义一致。
+            if ho_hist and (t_ho - ho_hist[-1][1]) < PINGPONG_MIN_GAP_S:
+                break
 
             def _score(w, at):
                 el = _el_deg(w["sat"], at)
@@ -523,6 +581,7 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             ho_d_ms = gc[2] if gc else d_ms
             ho_dop = gc[0] if gc else 0.0
             ho_slant = gc[1] if gc else 0.0
+            ho_el = _el_deg(cand["sat"], t_ho)
             exec_s = (2.0 * ho_d_ms + access_proc_ms + auth_extra_ms) / 1000.0
             if not has_ctx:
                 # 无预迁移：终端须在新星重新随机接入（完整接入流程），含前导竞争与附加调度时延
@@ -550,7 +609,8 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             # → 需重选并重传一次 → 产生额外中断。此前 T7 无任何失败路径（无条件 success）。
             ho_result = "success"
             if P["link_model_on"] and ho_slant:
-                if mac_fail_prob(ho_slant, AUTH_MAC_BYTES * 8, BIT_RATE_BPS) > rng.random():
+                if mac_fail_prob(ho_slant, AUTH_MAC_BYTES * 8, BIT_RATE_BPS,
+                                el_deg=ho_el) > rng.random():
                     ho_result = "confirm_fail"
                     n_confirm_fail += 1
                     interrupt += (2.0 * ho_d_ms + access_proc_ms) / 1000.0
@@ -575,8 +635,8 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
 
             trace.append(_mk("HANDOVER", k, tag, t_ho, cur["sat"], cand["sat"],
                              round(interrupt * 1000.0, 3), ho_dop, ho_slant, ho_result,
-                             predict_mismatch=mismatch, pingpong=pingpong,
-                             ho_el_cost_deg=el_cost, ebno=_link_ebno(ho_slant)))
+                             service=svc, predict_mismatch=mismatch, pingpong=pingpong,
+                             ho_el_cost_deg=el_cost, ebno=_link_ebno(ho_slant, ho_el)))
             cur, connect_sat, connect_t = cand, cand["sat"], start_connect
 
     summary = {"n_forged": n_forged, "n_forged_blocked": n_forged_blocked,
@@ -588,6 +648,7 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                "rerach_extra_ms": round(rerach_extra_ms, 1),
                "ho_total_ms_sum": round(ho_total_ms_sum, 1),
                "pre_migrate": P["pre_migrate"],
+               "t8_priority_on": P["t8_priority_on"],
                "geom_fail": geom_fail["n"], "params": dict(P)}
     # ---- 科学版 dp 调度计数（priority_mode=="dp" 时有效）----
     if P.get("priority_mode") == "dp":

@@ -104,13 +104,13 @@ static std::uniform_real_distribution<double> g_u01(0.0, 1.0);
 //   · 高优退避更短 → 重发更快、接入时延更低。
 // priority_on=False 时为「无优先级基线」（所有 tier 共用单池 g_slotLoad），用于量化增益。
 static bool       g_priorityOn     = true;  // 生存优先调度开关（default true，同 config）
-static double     g_prioReserveFrac[3] = {0.5, 0.3, 0.2}; // high/med/low 专用预留比例（同 config.PRIORITY_RESERVE_FRAC）
+static double     g_prioReserveFrac[3] = {0.25, 0.10, 0.65}; // high/med/low 专用预留比例（同 config.PRIORITY_RESERVE_FRAC，与 Python 轨一致）
 static double     g_prioBackoff[3] = {0.3, 0.6, 1.0}; // high/med/low 退避缩放（同 config.PRIO_BACKOFF）
 static std::map<std::pair<uint32_t,uint32_t>, uint32_t> g_slotP[3]; // 三档专用池 (sat,10ms槽)->已受理数
 // ---- ★科学版 dp 自适应阈值（★镜像 sim/protocol.py priority_mode="dp" + sim/prio_opt.py★）----
 // 替代静态比例 g_prioReserveFrac：用 Kaufman-Roberts 生灭过程精确解，按在线 EWMA 估计的
 // 各档到达率，每窗口重算最优 guard-channel 阈值 (g_h, g_m)，低危负载时回收高危闲置预留。
-static std::string g_priorityMode = "static"; // "static" | "dp"（default 与场景 priority_mode 一致）
+static std::string g_priorityMode = "dp"; // "static" | "dp"（default=dp：Kaufman-Roberts 自适应保护位，与 Python 轨 _slot_ok dp 分支机理一致；双轨对齐）
 static double g_prioEps      = 0.12;  // 高危阻塞率 QoS 上界 ε（同 config.PRIO_EPS）
 static double g_prioBeta     = 0.30;  // EWMA 新窗口权重（同 config.PRIO_BETA）
 static double g_prioWm       = 1.00, g_prioWl = 1.00; // 目标函数权重(中,低)（同 config.PRIO_WEIGHTS）
@@ -743,6 +743,11 @@ public:
     }
     // 决策时刻（同 Python: t_ho = max(预测LOS − ho_lead, 连接建立时刻)）
     double tHo = std::max(tLos - g_hoLeadS, m_accessFinT);
+    // ★P0-1 修复★：切换冷却——距上次切换 < 30s 不切，抑制仿真末端
+    // （两窗口几乎同时结束 + 星历误差抖动）造成的乒乓震荡（与 Python 轨同规则）。
+    if (!m_hoHist.empty() && (tHo - m_hoHist.back().second) < 30.0){
+      return;
+    }
     // 候选 A：预测 LOS 时刻仍可见的非服务星（重叠覆盖，先建后断）
     uint32_t cand = 0; double candScore = -1e9, candLos = -1;
     auto visLos = visibleAt(m_nodeId, tLos);

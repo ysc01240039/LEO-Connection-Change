@@ -12,7 +12,8 @@
 import math
 
 from .config import (CARRIER_FREQ_HZ, SPEED_OF_LIGHT, BOLTZMANN, EIRP_DBM,
-                     GT_DBI_K, NOISE_TEMP_K, BIT_RATE_BPS, BER_MODEL)
+                     GT_DBI_K, NOISE_TEMP_K, BIT_RATE_BPS, BER_MODEL,
+                     ATM_ATTEN_SLOPE_DB, MASK_ANGLE_DEG)
 
 
 def doppler_hz(radial_velocity_km_s: float) -> float:
@@ -38,9 +39,37 @@ def cn0_db_hz(slant_km: float) -> float:
     return rx_dbw - noise_density_dbw_hz + GT_DBI_K
 
 
-def ebno_db(slant_km: float, bit_rate_bps: float = BIT_RATE_BPS) -> float:
-    """Eb/N0 (dB) = C/N0 − 10·log10(Rb)。★已补全比特率项★"""
-    return cn0_db_hz(slant_km) - 10.0 * math.log10(bit_rate_bps)
+def atm_atten_db(el_deg: float | None) -> float:
+    """高程相关大气/雨衰 (dB)。
+
+    ★ 国奖级增强（2026-09-02）★：原模型仅自由空间损耗，仰角→斜距→Eb/N0 在 25°~90°
+    仅相差约 4 dB（7.6~11.9 dB），且切换目标星经选星打分偏好高仰角 → 实际虚警率恒≈0，
+    链路层「失去判别力」（审计 P1）。现引入高程相关大气衰耗（ITU-R 经典结论：
+    穿过大气层的路径长度 ∝ 1/sin(仰角)，低仰角/小区边缘衰耗急剧增大）：
+
+        A(el) = ATM_ATTEN_SLOPE_DB · (1/sin(el) − 1)，el∈(0,90]
+
+    天底(el=90°)→0 dB；25° 掩角边缘→约 ATM_ATTEN_SLOPE_DB·1.37 dB；
+    更低仰角(小区边缘/切换盲区边缘)衰耗快速增大 → Eb/N0 跌破解调门限 → BER 显著升高
+    → MAC 误码、合法终端误拒(虚警)/切换确认失败 成为**可观、可复现**的量。
+    这是把「仰角代价」与「信道误码」在小区边缘真正兑现为后果的关键。
+    """
+    if el_deg is None or el_deg <= 0.1:
+        return 0.0
+    s = math.sin(math.radians(min(el_deg, 90.0)))
+    if s <= 0:
+        return 0.0
+    return round(ATM_ATTEN_SLOPE_DB * (1.0 / s - 1.0), 3)
+
+
+def ebno_db(slant_km: float, bit_rate_bps: float = BIT_RATE_BPS,
+            el_deg: float | None = None) -> float:
+    """Eb/N0 (dB) = C/N0 − 10·log10(Rb) − 大气衰耗。
+
+    ★ 已补全比特率项与高程相关大气衰耗 ★
+    el_deg 由调用方在已知仰角时传入（接入/切换几何可算）；未传时退化为纯自由空间基线。
+    """
+    return cn0_db_hz(slant_km) - 10.0 * math.log10(bit_rate_bps) - atm_atten_db(el_deg)
 
 
 def _q(x: float) -> float:
@@ -57,14 +86,16 @@ def ber(ebno_db_value: float, model: str = BER_MODEL) -> float:
 
 
 def mac_fail_prob(slant_km: float, mac_bits: int,
-                  bit_rate_bps: float = BIT_RATE_BPS) -> float:
+                  bit_rate_bps: float = BIT_RATE_BPS,
+                  el_deg: float | None = None) -> float:
     """MAC 字段被信道误码破坏的概率（→ 合法终端被误拒 = 虚警率）。
 
     P_fail = 1 − (1 − BER)^(mac_bits)。
-    这是「仰角代价」兑现为真实后果的通路：仰角低 → 斜距大 → Eb/N0 低
+    这是「仰角代价」兑现为真实后果的通路：仰角低 → 斜距大 → Eb/N0 低（含大气衰耗）
     → BER 高 → MAC 被破坏概率高 → 合法终端被星上误拒。
+    el_deg 传入时计入小区边缘大气衰耗，使低仰角链路真正劣化。
     """
-    p_bit = ber(ebno_db(slant_km, bit_rate_bps))
+    p_bit = ber(ebno_db(slant_km, bit_rate_bps, el_deg=el_deg))
     if p_bit <= 0.0:
         return 0.0
     if p_bit >= 1.0:
