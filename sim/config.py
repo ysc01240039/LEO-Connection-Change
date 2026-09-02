@@ -9,7 +9,9 @@
 from pathlib import Path
 
 # ---- 路径 ----
-WORKSPACE = Path(r"E:/pytorchFile/NationalCreation1")
+# 项目根目录 = 本文件(sim/config.py)向上两级；不硬编码开发机绝对路径，
+# 保证仓库在任意环境（Linux/macOS/Windows/云沙箱）clone 后可直接运行。
+WORKSPACE = Path(__file__).resolve().parent.parent
 DATA_DIR = WORKSPACE / "data" / "sim"
 DOCS_DIR = WORKSPACE / "docs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
