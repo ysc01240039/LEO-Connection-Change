@@ -130,6 +130,14 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
 
     t0 = _dt.datetime.fromisoformat(SIM_START_UTC.replace("Z", "+00:00"))
     observer = wgs84.latlon(scenario["lat"], scenario["lon"], scenario["alt_m"])
+    # ★方案A 双轨同参★：每终端独立位置（中心 ±terminal_spread_deg 均匀），与 ns-3 轨同口径。
+    # 终端分散 → 同一时刻不同终端的「最佳接入星」不同 → 拥塞分散（不再单点重叠），
+    # 消除 Python 轨风暴成功率偏低的「单参考点下界」偏差。
+    _spread = scenario.get("terminal_spread_deg", 0.6)
+    _rng_pos = random.Random(rng_seed ^ 0x5EED0000)
+    term_obs = {k: wgs84.latlon(scenario["lat"] + _rng_pos.uniform(-_spread, _spread),
+                                 scenario["lon"] + _rng_pos.uniform(-_spread, _spread),
+                                 scenario["alt_m"]) for k in range(n_terminals)}
     sat_obj = {}
     for name, l1, l2 in sats:
         try:
@@ -142,13 +150,13 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
     def _time_at(rel_s):
         return ts.from_datetime(t0 + _dt.timedelta(seconds=float(rel_s)))
 
-    def _geom_core(name, rel_s):
+    def _geom_core(name, rel_s, term_id=0):
         sat = sat_obj.get(name)
         if sat is None or ts is None:
             geom_fail["n"] += 1
             return None
         try:
-            diff = sat - observer
+            diff = sat - term_obs.get(term_id, observer)
             g = diff.at(_time_at(rel_s))
             p = np.array(g.position.km)
             v = np.array(g.velocity.km_per_s)
@@ -163,26 +171,26 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             geom_fail["n"] += 1
             return None
 
-    def _geom(name, rel_s):
+    def _geom(name, rel_s, term_id=0):
         """返回 (doppler_hz, slant_km, delay_ms)；计算失败返回 None（显式，不再静默置 0）。"""
-        key = (name, round(float(rel_s), 1))
+        key = (name, round(float(rel_s), 1), term_id)
         v = _geom_cache.get(key)
         if v is None:
-            v = _geom_core(name, key[1])
+            v = _geom_core(name, key[1], key[2])
             _geom_cache[key] = v
         if v is None:
             return None
         return round(v[0], 1), round(v[1], 3), round(v[2], 3)
 
-    def _el_deg(name, rel_s):
-        key = (name, round(float(rel_s), 1))
+    def _el_deg(name, rel_s, term_id=0):
+        key = (name, round(float(rel_s), 1), term_id)
         v = _el_cache.get(key)
         if v is None:
             sat = sat_obj.get(name)
             if sat is None or ts is None:
                 return None
             try:
-                v = float((sat - observer).at(_time_at(key[1])).altaz()[0].degrees)
+                v = float((sat - term_obs.get(term_id, observer)).at(_time_at(key[1])).altaz()[0].degrees)
             except Exception:
                 return None
             _el_cache[key] = v
@@ -387,14 +395,14 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             events.append((nx["aos_s"], seq, "acc", k, tag, prio, arr0, is_forged, svc)); seq += 1
             continue
 
-        best = max(vis, key=lambda w: (_el_deg(w["sat"], t) or -1e9))
-        g = _geom(best["sat"], t)
+        best = max(vis, key=lambda w: (_el_deg(w["sat"], t, k) or -1e9))
+        g = _geom(best["sat"], t, k)
         if g is None:
             term_failed.add(k)
             trace.append(_mk("ACCESS", k, tag, t, -1, -1, -1.0, 0.0, 0.0, "fail"))
             continue
         dop, slant, d_ms = g
-        best_el = _el_deg(best["sat"], t)
+        best_el = _el_deg(best["sat"], t, k)
 
         # ---- 科学版 dp：仅「首次尝试」计入 offered load（重试是阻塞后果，不喂模型）----
         if P.get("priority_mode") == "dp" and term_attempts[k] == 0:
@@ -535,7 +543,7 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                 break
 
             def _score(w, at):
-                el = _el_deg(w["sat"], at)
+                el = _el_deg(w["sat"], at, k)
                 if el is None:
                     return -1e9
                 el_norm = max(0.0, min(1.0, (el - MASK_ANGLE_DEG) / (90.0 - MASK_ANGLE_DEG)))
@@ -585,11 +593,11 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             # ★审计修复 2026-09-02（第 2 轮）★：重连确认须在目标可达（start_connect）之后
             # 才能收发，故新链可用 = start_connect + exec_s（原从 t_ho 起算取 max，
             # 对盲区兜底分支低估一个执行时长，对重叠分支则高估可用时刻）。
-            gc = _geom(cand["sat"], t_ho)
+            gc = _geom(cand["sat"], t_ho, k)
             ho_d_ms = gc[2] if gc else d_ms
             ho_dop = gc[0] if gc else 0.0
             ho_slant = gc[1] if gc else 0.0
-            ho_el = _el_deg(cand["sat"], t_ho)
+            ho_el = _el_deg(cand["sat"], t_ho, k)
             if has_ctx:
                 # 有预迁移：新星持预置上下文，一次比对即确认（RACH-less）
                 n_premig_hit += 1
@@ -628,10 +636,10 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             vis_los = [w for w in visible_at(los_true) if w["sat"] != cur["sat"]]
             mismatch, el_cost = 0, 0.0
             if vis_los:
-                eb = max(vis_los, key=lambda w: (_el_deg(w["sat"], los_true) or -1e9))
+                eb = max(vis_los, key=lambda w: (_el_deg(w["sat"], los_true, k) or -1e9))
                 mismatch = 1 if eb["sat"] != cand["sat"] else 0
-                e1 = _el_deg(eb["sat"], los_true) or 0.0
-                e2 = _el_deg(cand["sat"], los_true) or 0.0
+                e1 = _el_deg(eb["sat"], los_true, k) or 0.0
+                e2 = _el_deg(cand["sat"], los_true, k) or 0.0
                 el_cost = round(e1 - e2, 2)
 
             # 乒乓（重定义）：窗口内切回曾服务星，或相邻切换间隔过短

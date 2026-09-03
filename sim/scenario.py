@@ -10,6 +10,9 @@
   这是把拦截率从 1.0 同义反复变为可计算指标的关键参数。
 - 新增 `ho_hyst`：切换迟滞，配合联合打分使乒乓率可证伪。
 - 所有参数与 ns-3 轨（leo_access.cc 命令行）及 data/sim/ns3_in/scenario.json 同参。
+- `terminal_spread_deg`（默认 0.6，见 protocol.py）：终端在中心 ±0.6° 均匀分布（★方案A 双轨同参★），
+  与 ns-3 轨每终端独立位置口径一致；protocol.py 据此生成每终端 observer，
+  消除「单参考点」导致的拥塞过度集中、风暴成功率偏低的下界偏差。
 """
 
 SCENARIOS = {
