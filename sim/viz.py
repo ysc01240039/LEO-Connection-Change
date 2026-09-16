@@ -43,7 +43,7 @@ def _plt():
     return _PLT["module"]
 
 
-def plot_coverage(windows, scenario_name, outdir=None):
+def plot_coverage(windows, scenario_name, outdir=None, extra_title=""):
     plt = _plt()
     out = Path(outdir) if outdir else DATA_DIR
     n = int(SIM_DURATION_S / TIME_STEP_S)
@@ -56,14 +56,14 @@ def plot_coverage(windows, scenario_name, outdir=None):
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(xs, cov, color="#1f77b4")
     ax.set_xlabel("时间 (分钟)"); ax.set_ylabel("可见卫星数")
-    ax.set_title(f"{scenario_name}：上空可见卫星数（仰角>{MASK_ANGLE_DEG}°）")
+    ax.set_title(f"{scenario_name}：上空可见卫星数（仰角>{MASK_ANGLE_DEG}°）{extra_title}")
     ax.grid(True, alpha=0.3)
     p = out / "coverage.png"
     fig.savefig(p, dpi=120); plt.close(fig)
     return p
 
 
-def plot_handover(trace, scenario_name, outdir=None):
+def plot_handover(trace, scenario_name, outdir=None, extra_title=""):
     plt = _plt()
     out = Path(outdir) if outdir else DATA_DIR
     ho = [e for e in trace if e.get("event_type") == "HANDOVER"]
@@ -71,7 +71,7 @@ def plot_handover(trace, scenario_name, outdir=None):
     fig, ax = plt.subplots(figsize=(10, 3))
     ax.scatter(xs, list(range(len(ho))), s=6, color="#d62728")
     ax.set_xlabel("时间 (分钟)"); ax.set_ylabel("切换序号")
-    ax.set_title(f"{scenario_name}：切换事件分布（共 {len(ho)} 次）")
+    ax.set_title(f"{scenario_name}：切换事件分布（共 {len(ho)} 次）{extra_title}")
     ax.grid(True, alpha=0.3)
     p = out / "handover.png"
     fig.savefig(p, dpi=120); plt.close(fig)
@@ -83,7 +83,7 @@ def _b64(path):
         return base64.b64encode(f.read()).decode()
 
 
-def plot_coverage_timeline(cov, step_s, scenario_name, outdir=None):
+def plot_coverage_timeline(cov, step_s, scenario_name, outdir=None, extra_title=""):
     """cov: 每步可见卫星数列表；step_s: 采样步长(s)。
     ★修复 2026-09-02★：补齐 outdir 参数（run_ns3.py 调用时传 rundir，
     原签名缺失导致 TypeError），产物落独立目录、不覆盖共享 coverage_ns3.png。"""
@@ -95,7 +95,7 @@ def plot_coverage_timeline(cov, step_s, scenario_name, outdir=None):
     ax.plot(xs, cov, color="#1f77b4", linewidth=1.4)
     ax.fill_between(xs, cov, color="#1f77b4", alpha=0.15)
     ax.set_xlabel("时间 (分钟)"); ax.set_ylabel("可见卫星数")
-    ax.set_title(f"{scenario_name}：上空可见卫星数时序（仰角>{MASK_ANGLE_DEG}°，真实星历）")
+    ax.set_title(f"{scenario_name}：上空可见卫星数时序（仰角>{MASK_ANGLE_DEG}°，真实星历）{extra_title}")
     ax.grid(True, alpha=0.3)
     p = out / "coverage.png"
     fig.savefig(p, dpi=120); plt.close(fig)
@@ -149,6 +149,7 @@ def write_report(metrics, provenance, scenario_name, cov_png, ho_png, out_path,
         meta_rows = "".join(
             f"<tr><td>{k}</td><td>{v}</td></tr>"
             for k, v in [("运行标识", manifest.get("run_tag", "")),
+                         ("仿真平台", "ns3" if "_ns3_" in manifest.get("run_tag", "") else "python"),
                          ("场景", f"{manifest.get('scenario_key','')} / 种子 {manifest.get('seed','')}"),
                          ("重复次数", manifest.get("reps", "")),
                          ("代码版本", manifest.get("git_commit", "")),

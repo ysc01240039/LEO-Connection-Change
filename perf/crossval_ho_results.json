@@ -603,5 +603,11 @@
       "加权阻塞率(中低危)": 0.0
     }
   },
-  "errors": {}
+  "errors": {},
+  "platform": "python+ns3",
+  "commit": "d260720",
+  "commit_full": "d260720552d21c246c534ab2434f17a3871b3129",
+  "scenario": "baseline(T2/T3)",
+  "produced_at": "2026-09-16T12:27:43.970390Z",
+  "_archive": "injected by exp/archive_compliance.py per 《数据存档规范》§二"
 }

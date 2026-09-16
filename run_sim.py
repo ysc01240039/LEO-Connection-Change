@@ -380,7 +380,9 @@ def main(scenario_key="wenchuan", group="oneweb", seed=20260901, reps=1,
     }
     write_scenario_json(rundir / "scenario_config.json", sc, prov, windows)
     write_trace_csv(rundir / "access_trace.csv", last_trace)
-    write_metrics_json(rundir / "metrics.json", metrics)
+    write_metrics_json(rundir / "metrics.json", metrics,
+                       platform="python", commit=_git_commit(),
+                       run_id=tag, scenario=scenario_key)
     (rundir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
@@ -390,8 +392,9 @@ def main(scenario_key="wenchuan", group="oneweb", seed=20260901, reps=1,
         return metrics, None, rundir
 
     print(f"[6/6] 生成图表与报告 ...")
-    pc = plot_coverage(windows, sc["name"], outdir=rundir)
-    ph = plot_handover(last_trace, sc["name"], outdir=rundir)
+    _suffix = f" [python | {tag} | {_git_commit()}]"
+    pc = plot_coverage(windows, sc["name"], outdir=rundir, extra_title=_suffix)
+    ph = plot_handover(last_trace, sc["name"], outdir=rundir, extra_title=_suffix)
     rep = write_report(metrics, prov, sc["name"], pc, ph, rundir / "report.html",
                         manifest, comparison)
     # latest 指针，便于脚本/Web 取最新结果

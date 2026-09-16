@@ -16,6 +16,7 @@
 """
 import subprocess
 import sys
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -220,8 +221,22 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     rundir = DATA_DIR / "runs" / f"{scenario_key}_s{seed}_ns3_{stamp}"
     rundir.mkdir(parents=True, exist_ok=True)
+    # ★ 存档合规（2026-09-16）★：写 metrics.json 时注入 §二 要求的顶层标签
+    # （platform / commit / run_id / scenario / produced_at）。仅追加字段，不改指标。
+    _m = dict(metrics)
+    _m["platform"] = "ns3"
+    try:
+        _c = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(DATA_DIR.parent.parent), text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        _c = "unknown"
+    _m["commit"] = _c
+    _m["run_id"] = f"{scenario_key}_s{seed}_ns3_{stamp}"
+    _m["scenario"] = scenario_key
+    _m["produced_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     (rundir / "metrics.json").write_text(
-        __import__("json").dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+        json.dumps(_m, ensure_ascii=False, indent=2), encoding="utf-8")
     (rundir / "access_trace.csv").write_bytes((ns3_io.NS3_OUT / "access_trace.csv").read_bytes())
     print(f"      产物 -> {rundir}")
 
@@ -232,8 +247,9 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
     cov = ns3_io.compute_coverage(ns3_io.NS3_IN / "ephemeris.csv", sc["lat"], sc["lon"],
                                   sc["alt_m"], params["mask_deg"], params["time_step_s"],
                                   int(params["sim_duration_s"] / params["time_step_s"]) + 1)
-    pc = plot_coverage_timeline(cov, params["time_step_s"], sc["name"], outdir=rundir)
-    ph = plot_handover(trace, sc["name"], outdir=rundir)
+    _suffix = f" [ns3 | {scenario_key}_s{seed}_ns3_{stamp} | {_c}]"
+    pc = plot_coverage_timeline(cov, params["time_step_s"], sc["name"], outdir=rundir, extra_title=_suffix)
+    ph = plot_handover(trace, sc["name"], outdir=rundir, extra_title=_suffix)
     print(f"[5/5] 图表: {pc.name}, {ph.name}")
     return metrics, (pc, ph), rundir
 
