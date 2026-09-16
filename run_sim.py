@@ -22,7 +22,7 @@ from pathlib import Path
 from sim.config import DATA_DIR
 from sim.scenario import get_scenario
 from sim.data_sources import fetch_tle
-from sim.orbit import build_timescale, compute_access
+from sim.orbit import build_timescale, compute_access, compute_grid_windows
 from sim.protocol import run_protocol
 from sim.eval import (compute_metrics, merge_reps, rel17_improvement,
                      confidence_intervals, ablation_rows)
@@ -36,7 +36,9 @@ def parse_args(argv):
             "hyst": None, "compromised": None, "no_link": False,
             "no_priority": False, "priority_cmp": False, "rel17": False,
             "no_pre_migrate": False, "prio_mode": "dp",
-            "ablation": False, "t8": False, "premigrate_cmp": False}
+            "ablation": False, "t8": False, "premigrate_cmp": False,
+            "ho_policy": "predictive", "elev_th": None, "cho_cond": None, "cho_ttt": None,
+            "rach_scheme": None}
     pos = []
     i = 0
     while i < len(argv):
@@ -78,6 +80,16 @@ def parse_args(argv):
             args["t8"] = True; i += 1
         elif a == "--premigrate-cmp":
             args["premigrate_cmp"] = True; i += 1
+        elif a == "--ho-policy" and nxt:
+            args["ho_policy"] = nxt; i += 2
+        elif a == "--elev-th" and nxt:
+            args["elev_th"] = float(nxt); i += 2
+        elif a == "--cho-cond" and nxt:
+            args["cho_cond"] = float(nxt); i += 2
+        elif a == "--cho-ttt" and nxt:
+            args["cho_ttt"] = float(nxt); i += 2
+        elif a == "--rach-scheme" and nxt:
+            args["rach_scheme"] = nxt; i += 2
         else:
             pos.append(a); i += 1
     return pos, args
@@ -98,8 +110,10 @@ def _sim_core(sc, group, seed, params, no_link):
     sats, prov = fetch_tle(group)
     ts = build_timescale()
     windows, _ = compute_access(sats, sc["lat"], sc["lon"], sc["alt_m"], ts)
+    # ★方案A★ 5×5 网格窗（终端吸附格点；ns-3 轨读同一套 → 双轨可见性严格一致）
+    cell_windows = compute_grid_windows(sats, sc["lat"], sc["lon"], sc["alt_m"], ts)
     trace, summary = run_protocol(windows, sc, sats=sats, ts=ts,
-                                  rng_seed=seed, params=params)
+                                  rng_seed=seed, params=params, cell_windows=cell_windows)
     metrics = compute_metrics(trace, summary)
     return metrics, trace, summary, windows, prov
 
@@ -124,7 +138,7 @@ def _merge_improvements(imp_list):
 def main(scenario_key="wenchuan", group="oneweb", seed=20260901, reps=1,
          no_viz=False, overrides=None, no_link=False,
          priority_cmp=False, rel17=False, ablation=False, t8=False,
-         premigrate_cmp=False):
+         premigrate_cmp=False, ho_policy="predictive", elev_th=None, cho_cond=None, cho_ttt=None):
     ov = overrides or {}
     print(f"[1/6] TLE（缓存优先）({group}) ...")
     sats, prov = fetch_tle(group)
@@ -138,7 +152,9 @@ def main(scenario_key="wenchuan", group="oneweb", seed=20260901, reps=1,
     from sim.config import MASK_ANGLE_DEG
     print(f"[3/6] 计算真实可见性窗口（仰角>{MASK_ANGLE_DEG}°）...")
     windows, _ = compute_access(sats, sc["lat"], sc["lon"], sc["alt_m"], ts)
-    print(f"      可见窗总数: {len(windows)}")
+    print(f"      可见窗总数: {len(windows)}（中心点）")
+    print(f"      ★方案A★ 计算 5×5 网格窗（终端吸附格点，与 ns-3 轨同源）...")
+    cell_windows = compute_grid_windows(sats, sc["lat"], sc["lon"], sc["alt_m"], ts)
 
     params = {k: v for k, v in ov.items() if v is not None}
     if no_link:
@@ -152,7 +168,8 @@ def main(scenario_key="wenchuan", group="oneweb", seed=20260901, reps=1,
         rseed = seed + r
         print(f"[4/6] 运行协议模型 seed={rseed} ...")
         trace, summary = run_protocol(windows, sc, sats=sats, ts=ts,
-                                      rng_seed=rseed, params=params)
+                                      rng_seed=rseed, params=params,
+                                      cell_windows=cell_windows)
         print(f"      事件总数: {len(trace)}")
         all_metrics.append(compute_metrics(trace, summary))
         last_trace, last_summary = trace, summary
@@ -389,7 +406,9 @@ if __name__ == "__main__":
     pos, args = parse_args(sys.argv[1:])
     sk = pos[0] if len(pos) > 0 else "wenchuan"
     gp = pos[1] if len(pos) > 1 else "oneweb"
-    ov = {k: args[k] for k in ("ho_lead", "ephem_err", "w_el", "w_dwell", "hyst", "compromised")}
+    ov = {k: args[k] for k in ("ho_lead", "ephem_err", "w_el", "w_dwell", "hyst",
+                                "compromised", "ho_policy", "elev_th", "cho_cond",
+                                "rach_scheme")}
     if args["prio_mode"] != "dp":
         ov["priority_mode"] = args["prio_mode"]
     if args["no_pre_migrate"]:
@@ -398,4 +417,6 @@ if __name__ == "__main__":
          overrides=ov, no_link=args["no_link"],
          priority_cmp=args["priority_cmp"], rel17=args["rel17"],
          ablation=args["ablation"], t8=args["t8"],
-         premigrate_cmp=args["premigrate_cmp"])
+         premigrate_cmp=args["premigrate_cmp"],
+         ho_policy=args["ho_policy"], elev_th=args["elev_th"], cho_cond=args["cho_cond"],
+         cho_ttt=args["cho_ttt"])

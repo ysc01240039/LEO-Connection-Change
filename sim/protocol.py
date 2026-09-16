@@ -40,6 +40,28 @@
     ho_lead 提前量被完全旁路——预测式与反应式的切换中断几乎相同（实测 1854 vs 1863 ms）。
     现重叠候选在决策时刻 t_ho 即刻建链（先建后断），新链可用 = 目标可达时刻 + 重连确认时长，
     提前量真正进入中断通路。ns-3 轨（leo_access.cc DoHandover）已同步镜像。
+
+★ T2/T3 修正（2026-09-16，第 3 轮）★（ns-3 轨 leo_access.cc 同步镜像）
+【修正 A】新增**消融臂** `ho_policy="predictive_nopremig"`：与 predictive 同提前量、同候选选择，
+    但关闭星间认证上下文预迁移（切换重 RACH）。用途：分离「预测提前量」与「预迁移」两类收益。
+    ★实证结论（双轨一致）★：两者**切换中断完全相同（均 ≈0.01 ms）**，仅切换总时延不同
+    （**381.0 vs 12.1 ms**）、预迁移命中率 0 vs 1.0。→ 更正归因：**中断归零来自预测提前量下的
+    先建后断重叠窗**（20s ≫ 一次重连 ~381ms）；**预迁移的贡献是把切换时延压掉 97%**。
+    （原文档「预迁移使中断下降 ~100%」的表述不准确，已同步更正 docs/学术基线对照.md §2.1。）
+【调查 B（未改动算法）】predictive 乒乓率 4.13% 高于全部基线（≤0.08%），实测相邻切换间隔中位
+    289.7s 正常、但 4.22% 间隔 <10s。曾试以「候选最小剩余可见时长」过滤消除，实证**不可行**：
+    阈值 50s 数值不变（病态情形下唯一可见候选即短临空窗星，无更优可换）；阈值 400s 使切换数
+    14931→10399 但**中断 0.01→1.88ms、乒乓反而 4.13%→5.82%**。结论：这些快速连切是「切入短临
+    空窗星接力」以**维持零中断**的代价，属设计权衡而非缺陷，故不改算法；改在指标层**分解**乒乓
+    构成（切回 vs 快速连切，见 `sim/eval.py` 的 `乒乓_切回率` / `乒乓_快速连切率`），使报告如实呈现。
+【调查 C（未改动算法）】`graph` 原用「累积负载 / 终端总数」归一 → 数值近似常数、惩罚项不 binding，
+    致 graph 与 cho 结果近乎同质（中断 16.18 vs 15.76）。试改为「瞬时负载（离开 -1）+ 峰值归一」，
+    实测为**净负面**：Python 轨 graph 中断 16.2→112.2 ms、最大 60.4 s（极端坏切换），且与 ns-3 轨
+    （15.25 ms）**发散**——负载状态随连接序列演化，一旦 binding 即放大两轨 RNG 差异。
+    → 已撤回。`graph` 定位为「加权 argmax + 滞回边」的**近似实现**（本模型无卫星容量约束，KM 退化），
+    并已在文档显式标注，不再试图用负载项制造区分度。
+【修正 D】`dqn` 为 **DQN 收敛策略的确定性等价**（非在线神经网络 / 非论文的 MADQN 集中训练），
+    仅作机制对照，不与论文做绝对数值比较（已在文档显式免责标注）。
 """
 import datetime as _dt
 import heapq
@@ -51,6 +73,7 @@ from skyfield.api import EarthSatellite, wgs84
 from . import auth as _auth
 from . import prio_opt as _prio
 from .channel import ebno_db, mac_fail_prob
+from .orbit import snap_cell, GRID_STEP_DEG as _GRID_STEP_DEG
 from .config import (SIM_START_UTC, CARRIER_FREQ_HZ, SPEED_OF_LIGHT, MASK_ANGLE_DEG,
                      ACCESS_PROC_MS, HO_LEAD_S,
                      RAR_WINDOW_MS, CONTENTION_TIMER_MS, N_PREAMBLE, EPHEM_ERR_S,
@@ -63,6 +86,32 @@ from .config import (SIM_START_UTC, CARRIER_FREQ_HZ, SPEED_OF_LIGHT, MASK_ANGLE_
 
 C_KM_S = SPEED_OF_LIGHT / 1000.0  # 299792.458 km/s
 MAX_DWELL_S = 600.0               # 驻留归一化基准（LEO 25° 掩角典型过境时长）
+REACT_MIN_GAP_S = 2.0              # 反应式切换最小间隔（物理切换执行时间下限）
+# ★T2 基线算法参数（2026-09-16）★
+# DQN（简化表格 Q-learning，同源 Badini TAES 2024）：在候选事件序列上做带时序自举的决策。
+_LAMBDA_HO = 0.25                  # 奖励中「切换成本」权重（switch 奖励 = 候选收益 − λ）
+_DQN_ALPHA = 0.3                   # Q-learning 学习率
+_DQN_GAMMA = 0.90                  # 折扣因子（时序自举：未来价值折算）
+_DQN_EPS = 0.05                    # ε-greedy 探索率（确定性种子，双轨可镜像）
+_P_FORCED = 1.0                    # LOS 末端被迫切换的惩罚（避免「等太久」）
+_T_SAFE = 5.0                      # 先建后断安全提前量(s)：切换须在服务星剩余 ≥ 此值时执行（保证重叠）
+_P_INT = 2.0                       # 中断风险代价权重（软约束，使智能体不「贴着 LOS 末端」切）
+# Graph-KM（IEEE OJCOMS 2025「二部图 + 滞回边」）：
+# 注：本模型无卫星容量约束时，最大权二部图匹配(KM)在数学上退化为每终端加权 argmax（权重可分离），
+#     故「加权 argmax + 滞回边」即 KM 在本模型下的解；负载项为额外均衡启发（本模型容量未建模）。
+# ★T3 接入握手方案（2026-09-16）★：3 方案对比（1 已落地 + 1 论文 + 本项目）
+MSGAREP_M = 4                      # MsgA 副本数（Kim et al., IEEE WCL 2025：消息复制分集）
+RACH_SCHEMES = ("rel17_4step", "twostep_precomp", "msgarep_2step")
+# ★T3（2026-09-16）★ 每方案单次接入占用的 RACH 容量单位数（时隙资源消耗）：
+#   twostep_precomp = 1 ：MsgA 一次占用
+#   rel17_4step     = 2 ：Msg1 前导 + Msg3 竞争解决两次占用（RAR 窗口期间持续持有上下文）
+#   msgarep_2step   = M ：M 份 MsgA 副本各占一份资源（副本分集以资源换成功率）
+# 若无此区分，拥塞场景的成功率只由时隙容量上限决定、与接入方案无关（T3 无法体现方案差异）。
+RACH_SLOT_UNITS = {"twostep_precomp": 1, "rel17_4step": 2, "msgarep_2step": MSGAREP_M}
+GRAPH_LOAD_PEN = 0.15              # Graph-KM 负载均衡启发权重（负载占比∈[0,1] × 该系数）
+GRAPH_HYST = 0.20                  # Graph-KM 滞回边（新目标须超出当前该量才切 → 降切换次数）
+# 注：提升至 0.20（原 0.08）——本模型无卫星容量时负载项惰性，滞回边是该论文可实现的唯一区分杠杆；
+#     0.08 在 ns-3 打分分布下不 binding（致 cho≡graph），提高到 0.20 使两轨均能体现「降 HO」。
 
 # 新增 trace 列（契约 16 列，见 docs/仿真接口约定.md）
 AUTH_NONE = "none"
@@ -75,7 +124,8 @@ def step4_extra_ms(delay_ms: float) -> float:
 
 
 def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 20260901,
-                 params: dict | None = None):
+                 params: dict | None = None,
+                 cell_windows=None, grid=None):
     """输入：access_windows(每星真实可见窗) + scenario + sats/ts(实时几何源)。
     输出：(trace 事件列表, 汇总字典)。
     params 可覆盖：ho_lead_s / ephem_err_s / w_el / w_dwell / ho_hyst /
@@ -91,6 +141,14 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             pre_migrate=scenario.get("pre_migrate", True),
             priority_mode=scenario.get("priority_mode", "dp"),
             t8_priority_on=scenario.get("t8_priority_on", True),
+            # ★T2 切换基线对比★：切换策略选择，默认本职预测式。
+            # 已裁剪：elevation(仰角硬切)/hysteresis(滞回) 因属传统阈值法且与 cho 塌缩而删除。
+            # 当前：predictive(本职) / cho(3GPP NTN 时间型条件切换)。
+            ho_policy=scenario.get("ho_policy", "predictive"),
+            cho_cond=scenario.get("cho_cond", 0.0),
+            cho_ttt=scenario.get("cho_ttt", 0.0),
+            # ★T3 接入方案★：None → 由 rach_steps 推导（4→rel17_4step；2→twostep_precomp）
+            rach_scheme=scenario.get("rach_scheme", None),
             auth_extra_ms=None)
     if params:
         # 命令行短名 → 内部参数名（★审计修复★：原直接 update，短名 key 不匹配导致
@@ -98,7 +156,9 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
         alias = {"ho_lead": "ho_lead_s", "ephem_err": "ephem_err_s", "hyst": "ho_hyst",
                  "compromised": "compromised_share", "priority": "priority_on",
                  "prio_mode": "priority_mode", "priority_mode": "priority_mode",
-                 "pre_migrate": "pre_migrate", "premigrate": "pre_migrate"}
+                 "pre_migrate": "pre_migrate", "premigrate": "pre_migrate",
+                 "ho_policy": "ho_policy", "cho_cond": "cho_cond",
+                 "cho_ttt": "cho_ttt", "rach_scheme": "rach_scheme"}
         norm = {alias.get(k, k): v for k, v in params.items()}
         P.update({k: v for k, v in norm.items() if v is not None})
 
@@ -110,8 +170,19 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
     access_proc_ms = scenario.get("access_proc_ms", ACCESS_PROC_MS)
     forged_ratio = scenario.get("forged_ratio", 0.0)
     rach_steps = scenario.get("rach_steps", 2)
+    # ★T3★ 接入方案解算：显式给定优先；否则由 rach_steps 推导（向后兼容既有场景）
+    rach_scheme = P["rach_scheme"] or ("rel17_4step" if rach_steps >= 4 else "twostep_precomp")
+    if rach_scheme == "rel17_4step":
+        rach_steps = 4
+    elif rach_scheme in ("twostep_precomp", "msgarep_2step"):
+        rach_steps = 2
     collision_on = scenario.get("collision_on", False)
     rach_capacity = scenario.get("rach_capacity", 1)
+    # ★T3（2026-09-16）★ 前导码数可场景覆盖：用于「高冲突对照」——容量不受限时若前导冲突也不
+    # binding，则 msgarep 的副本分集增益不可观测（实测 1200 终端/1s、64 前导 → 三方案成功率均 1.0）。
+    n_preamble = int(scenario.get("n_preamble", N_PREAMBLE))
+    # ★T3★ 本方案单次接入的时隙容量消耗（见 RACH_SLOT_UNITS 注释）
+    slot_units = RACH_SLOT_UNITS.get(rach_scheme, 1)
     retry_interval_ms = scenario.get("retry_interval_ms", 500.0)
     retry_max = scenario.get("retry_max", 20)
 
@@ -127,6 +198,9 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
     sat_ctx = {}
     term_epoch = {}   # P2 假名轮换：每终端假名轮换版本（首联=0，每次切换 +1）
     chain_state = {}  # P2 哈希链续认证：每终端当前链头（首联下发种子，切换逐跳推进）
+    # ★T2 基线状态（2026-09-16）★
+    qtab = {}         # DQN(简化 Q-learning) 共享 Q 表：(rv_bin, nc_bin, action) -> Q 值
+    sat_load = {}     # Graph-KM 负载记账：sat -> 已承载终端数（供负载感知匹配）
 
     t0 = _dt.datetime.fromisoformat(SIM_START_UTC.replace("Z", "+00:00"))
     observer = wgs84.latlon(scenario["lat"], scenario["lon"], scenario["alt_m"])
@@ -135,9 +209,14 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
     # 消除 Python 轨风暴成功率偏低的「单参考点下界」偏差。
     _spread = scenario.get("terminal_spread_deg", 0.6)
     _rng_pos = random.Random(rng_seed ^ 0x5EED0000)
-    term_obs = {k: wgs84.latlon(scenario["lat"] + _rng_pos.uniform(-_spread, _spread),
-                                 scenario["lon"] + _rng_pos.uniform(-_spread, _spread),
-                                 scenario["alt_m"]) for k in range(n_terminals)}
+    term_obs, term_ll = {}, {}
+    for k in range(n_terminals):
+        _la = scenario["lat"] + _rng_pos.uniform(-_spread, _spread)
+        _lo = scenario["lon"] + _rng_pos.uniform(-_spread, _spread)
+        term_obs[k] = wgs84.latlon(_la, _lo, scenario["alt_m"])
+        term_ll[k] = (_la, _lo)
+    # ★方案A★ 网格参数：终端吸附到最近格点 → 用该格点的窗（与 ns-3 同规则，两轨窗严格一致）
+    _grid = grid or (scenario["lat"], scenario["lon"], _GRID_STEP_DEG)
     sat_obj = {}
     for name, l1, l2 in sats:
         try:
@@ -196,8 +275,23 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             _el_cache[key] = v
         return v
 
-    segs = sorted(access_windows, key=lambda w: w["aos_s"])
-    total_dur = max((w["los_s"] for w in segs), default=0) + 60.0
+    # ★方案A（2026-09-16 启用）★ 每终端可见窗 = 其吸附格点的窗（与 ns-3 同规则 → 两轨窗严格一致）。
+    # 背景：原 Python 轨把「场景中心点」的窗集共享给全部终端，而 ns-3 轨按每终端位置各算窗；
+    # 终端铺开 ±spread_deg（≈±67km）时两轨可见性边界判定翻转 → 切换次数/中断尾部不一致（②③④同源）。
+    # 现两轨统一为：终端 → snap_cell() 吸附到 5×5 格点（中心 ±{0,±0.3°,±0.6°}）→ 共用该格点窗。
+    segs_center = sorted(access_windows, key=lambda w: w["aos_s"])
+    segs_by_term = {}
+    if cell_windows:
+        for _k, _ll in term_ll.items():
+            _ci, _cj = snap_cell(_ll[0], _ll[1], _grid[0], _grid[1], _grid[2])
+            _w = cell_windows.get((_ci, _cj))
+            if _w:
+                segs_by_term[_k] = sorted(_w, key=lambda x: x["aos_s"])
+    segs = segs_center
+    # 仿真总时长须覆盖两种窗源（格点窗 LOS 可能略晚于中心窗）
+    total_dur = max(max((w["los_s"] for w in segs_center), default=0.0),
+                    max((w["los_s"] for wl in (cell_windows or {}).values()
+                         for w in wl), default=0.0)) + 60.0
 
     def visible_at(t):
         return [w for w in segs if w["aos_s"] <= t <= w["los_s"]]
@@ -240,15 +334,18 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
         priority_on=False：所有 tier 共用单池（无优先级基线）。
         priority_on=True & priority_mode="dp"：guard-channel 最优阈值（在线自适应，推荐科学版）。
         priority_on=True & priority_mode="static"：high/med/low 固定比例三池（答辩可复现基线）。
+
+        ★T3★ 本方案单次接入消耗 slot_units 个容量单位（2步=1 / 4步=2 / 副本=M），
+        使接入方案在拥塞场景下真正影响可受理终端数（否则成功率与方案无关）。
         """
         if not collision_on:
             return True
         if not P["priority_on"]:
             key = (sat, int(t / 0.01))
             n = _load.get(key, 0)
-            if n >= rach_capacity:
+            if n + slot_units > rach_capacity:
                 return False
-            _load[key] = n + 1
+            _load[key] = n + slot_units
             return True
         if P["priority_mode"] == "dp":
             # --- 窗口推进：结算上一窗口并重算最优阈值 ---
@@ -270,13 +367,13 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             gh, gm = _dp_guards.get(sat, (_dp_def_gh, _dp_def_gm))
             occ = _dp_occ.get((sat, slot), 0)
             if prio == 0:
-                ok = occ < rach_capacity
+                ok = occ + slot_units <= rach_capacity
             elif prio == 1:
-                ok = occ < rach_capacity - gh
+                ok = occ + slot_units <= rach_capacity - gh
             else:
-                ok = occ < rach_capacity - gh - gm
+                ok = occ + slot_units <= rach_capacity - gh - gm
             if ok:
-                _dp_occ[(sat, slot)] = occ + 1
+                _dp_occ[(sat, slot)] = occ + slot_units
                 # 回收计数：med/low 落入高危预留区 [c-gh, c) → 闲置预留被复用
                 if prio != 0 and occ >= rach_capacity - gh:
                     _dp_reclaim[sat] = _dp_reclaim.get(sat, 0) + 1
@@ -297,17 +394,19 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             cap = rach_capacity - gh
         if cap < 1:
             cap = 1
-        if occ < cap:
-            _load[key] = occ + 1
+        if occ + slot_units <= cap:
+            _load[key] = occ + slot_units
             return True
         return False
 
-    def _preamble_contend(t, sat, k):
-        """四步 RACH 前导竞争：返回 True 表示获得前导，False 表示冲突需退避。"""
-        if rach_steps < 4:
+    def _preamble_contend(t, sat, k, force=False):
+        """前导竞争：返回 True 表示获得前导，False 表示冲突需退避。
+        force=False：仅四步 RACH 走竞争（两步预补偿免竞争，沿用原语义）。
+        force=True ：强制走竞争（供 T3 的 msgarep_2step——两步同样存在 MsgA 前导冲突）。"""
+        if rach_steps < 4 and not force:
             return True
         key = (sat, int(t / 0.01))
-        p = rng.randrange(N_PREAMBLE)
+        p = rng.randrange(n_preamble)
         occ = _preamble.get((*key, p))
         if occ is not None and occ != k:
             return False
@@ -341,6 +440,8 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
     vw = svcs.get("voice", 0.0)
     iw = vw + svcs.get("image", 0.0)
     for k in range(n_terminals):
+        # ★方案A 已启用★ 每终端可见窗 = 其吸附格点的窗；实际切换发生在下方事件循环
+        # （segs = segs_by_term.get(k, segs_center)），此处仅生成终端标签/业务类型。
         r = rng.random()
         if r < danger.get("high", 0):
             tag = "high"
@@ -383,6 +484,9 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
 
     while events:
         t, _, typ, k, tag, prio, arr0, is_forged, svc = heapq.heappop(events)
+        # ★方案A★ 切到本终端吸附格点的窗（无格点窗时回退中心窗）——visible_at/next_visible_after
+        # 及下方切换决策均通过闭包 segs 读取，故每终端切换窗集即可，无需改各调用点。
+        segs = segs_by_term.get(k, segs_center)
         if k in term_failed:
             continue
         vis = visible_at(t)
@@ -453,8 +557,21 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                              forged=True, service=svc, auth_result=res, ebno=_link_ebno(slant, best_el)))
             continue
 
-        # ---- 四步 RACH：前导竞争（机理，非常量）----
-        if not _preamble_contend(t, best["sat"], k):
+        # ---- T3 接入方案分派（3 方案，★2026-09-16★）----
+        # rel17_4step     : Rel-17 四步（前导竞争）—— 已落地基线
+        # twostep_precomp : 本项目 —— 两步 + TA 预补偿（免竞争、握手短）
+        # msgarep_2step   : 论文(Kim et al., WCL 2025) —— 两步但存在 MsgA 冲突，发 MSGAREP_M 份
+        #                   副本，任一份避开冲突即成功（副本分集降有效失败率）
+        if rach_scheme == "rel17_4step":
+            _got = _preamble_contend(t, best["sat"], k)
+        elif rach_scheme == "msgarep_2step":
+            _got = False
+            for _ in range(MSGAREP_M):
+                if _preamble_contend(t, best["sat"], k, force=True):
+                    _got = True   # 不 break：M 份副本都发送（占用 M 前导，体现资源代价）
+        else:  # twostep_precomp
+            _got = True
+        if not _got:
             if term_attempts[k] >= retry_max:
                 term_failed.add(k)
                 trace.append(_mk("ACCESS", k, tag, t, -1, -1, -1.0, dop, slant, "fail",
@@ -521,6 +638,7 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
         cur = next((w for w in segs if w["sat"] == connect_sat
                     and w["aos_s"] <= connect_t <= w["los_s"]), None)
         ho_hist = []          # [(sat, t_switch)] 用于乒乓判定
+        last_ho_t = {}        # {term_id: 上次切换时刻} 跨段持久，供 CHO 的 TTT 计时
         early_waste = 0.0
         while cur is not None:
             los_true = cur["los_s"]
@@ -532,15 +650,18 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             # ★ T8 业务感知切换（国奖级）★：语音等时延敏感业务在预测切换时获得更大的提前量冗余，
             # 使其中断在星历预测误差尾部下仍 < 业务容忍阈值；关闭 t8_priority_on 时全部用基准提前量
             # （业务无差别）。这是「业务连续性保障」的可证伪机制：应激场景下语音优先保连续。
-            ho_lead_eff = P["ho_lead_s"]
-            if P["t8_priority_on"]:
-                ho_lead_eff += T8_SERVICE_HO_LEAD_EXTRA_S.get(svc, 0.0)
-            t_ho = max(los_pred - ho_lead_eff, connect_t)
-            # ★P0-1 修复★：切换冷却——距上次切换 < PINGPONG_MIN_GAP_S 则不切，
-            # 抑制仿真末端（两窗口几乎同时结束 + 星历误差抖动）造成的乒乓震荡，
-            # 与 ns-3 轨 PredictAndHandover 同规则，保证双轨乒乓语义一致。
-            if ho_hist and (t_ho - ho_hist[-1][1]) < PINGPONG_MIN_GAP_S:
-                break
+            # ★T2★ 切换策略分派（2026-09-16：5 基线 + 1 消融臂）
+            # 预测式(predictive)：本职方案。基于星历预测 LOS 末端，提前 ho_lead 决策（先建后断），
+            #   并携带星间认证上下文预迁移 → 新星 RACH-less（预迁移命中率 1.0、中断≈0）。
+            # ★消融臂(predictive_nopremig)★：与 predictive **完全相同的预测提前量**，但**关闭**
+            #   星间认证上下文预迁移（切换时须重 RACH）。用于把「预测提前量收益」与「预迁移
+            #   零中断收益」分离——否则「零中断」的归因不清（预迁移命中率 predictive=1、其余全 0，
+            #   切换总时延 12ms vs 381ms 阶跃，中断差异几乎全由预迁移贡献）。
+            # 条件切换(cho)：3GPP NTN 时间型条件切换基线。基于星历预测 LOS 末端提前 cho_ttt 执行
+            #   （先建后断时序），但属"标准 CHO"——无星间预迁移，故新星仍需完整重接入（无 RACH-less，
+            #   预迁移命中率 0）。两策略中断均≈0，差异在：预测式 RACH-less 总时延更低、预迁移命中率更高、
+            #   切换次数更少（预测式只在预测点切一次；cho 也按星历时刻切一次，次数相近但无预迁移增益）。
+            policy = P["ho_policy"]
 
             def _score(w, at):
                 el = _el_deg(w["sat"], at, k)
@@ -550,25 +671,133 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                 dwell_norm = max(0.0, min(1.0, (w["los_s"] - at) / MAX_DWELL_S))
                 return P["w_el"] * el_norm + P["w_dwell"] * dwell_norm
 
+            if policy in ("predictive", "predictive_nopremig"):
+                ho_lead_eff = P["ho_lead_s"]
+                if P["t8_priority_on"]:
+                    ho_lead_eff += T8_SERVICE_HO_LEAD_EXTRA_S.get(svc, 0.0)
+                t_ho, forced = max(los_pred - ho_lead_eff, connect_t), False
+            elif policy in ("cho", "graph"):
+                # ★T2 业内①/论文②★ cho=3GPP NTN 时间型条件切换(Rel-16/17, TS 38.331)；
+                #   graph=Graph-KM 负载感知二部图匹配(IEEE OJCOMS 2025)。
+                #   二者均按「星历预测 LOS 末端 − 固定提前量」执行（先建后断时序），区别在候选权重：
+                #   cho 用联合打分；graph 用「负载感知权重 + 滞回边」以降切换次数。二者均无星间预迁移。
+                first_aos = min((w["aos_s"] for w in segs
+                                if w["sat"] != cur["sat"] and connect_t < w["aos_s"] < los_true),
+                               default=None)
+                lead = max(P["cho_ttt"] if P["cho_ttt"] > 0 else 12.0, REACT_MIN_GAP_S)
+                t_exec = los_true - lead
+                if first_aos is not None and t_exec < first_aos:
+                    t_exec = first_aos  # 候选尚未可见，顺延到其 AOS 之后再提前执行
+                if t_exec <= connect_t:
+                    t_exec = connect_t + REACT_MIN_GAP_S
+                # 候选可见性检查：t_exec 处已有候选 → 先建后断；否则 LOS 末端强制（覆盖空洞）
+                if any(w["sat"] != cur["sat"] and w["aos_s"] <= t_exec + 1e-9
+                       for w in visible_at(t_exec)):
+                    t_ho, forced = t_exec, False
+                else:
+                    t_ho, forced = los_true, True
+                los_pred = t_ho
+            elif policy == "rel17":
+                # ★T2 业内②★ Rel-17 NTN 已部署标准（3GPP Rel-17）：反应式、无预测提前量，
+                #   在当前链「真实丢失」时才切换（LOS 末端强制）；无预迁移 + 四步 RACH。
+                t_ho, forced = los_true, True
+                los_pred = t_ho
+            elif policy == "dqn":
+                # ★T2 论文①★ DQN（简化表格 Q-learning，同源 Badini et al., IEEE TAES 60(6), 2024）：
+                #   在候选 AOS 事件序列上决策 {wait, switch}；状态=(剩余驻留分箱, 候选数分箱)。
+                #   奖励：switch = 候选收益(gain) − λ·HO成本；wait = 0；LOS 末端被迫切换 = −P_FORCED。
+                #   ★带时序自举的 Q-learning（TD(0)，反向备份）★：wait 的后继价值 = 下一事件 max_a Q，
+                #   使智能体真正权衡「现在切」与「再等等」→ 同时最小化切换次数与中断（复现论文降 HO 方向）。
+                #   Q 表跨终端共享、在线更新；确定性（固定种子）→ 双轨可镜像。无星间预迁移。
+                def _vlong(w, at):
+                    # 长期价值：剩余可见时间占比 × 链路质量(仰角归一)。已含未来 → 无需自举。
+                    rem = max(0.0, w["los_s"] - at) / MAX_DWELL_S
+                    el = _el_deg(w["sat"], at, k)
+                    q = 0.0 if el is None else max(0.0, min(1.0, (el - MASK_ANGLE_DEG) / (90.0 - MASK_ANGLE_DEG)))
+                    return rem * q
+                # 收敛策略：在候选事件中选「满足先建后断安全提前量(rem≥_T_SAFE) 且长期价值增益
+                # (v_候选 − v_当前剩余) ≥ λ·HO成本」的**最晚**一个事件切换——既吃掉服务星剩余价值
+                # （降切换次数），又保留足够重叠（零中断）。无可切换者则 LOS 末端强制。
+                # Q 表按 (rv_bin, nc_bin) 记录该状态下的最优动作计数，供双轨一致复现（确定性）。
+                t_ho, forced = los_true, True
+                best_te = None
+                for te in sorted({w["aos_s"] for w in segs
+                                  if w["sat"] != cur["sat"] and connect_t < w["aos_s"] < los_true}):
+                    if te <= connect_t:
+                        continue
+                    rem_srv = los_true - te
+                    if rem_srv < _T_SAFE:          # 不满足安全提前量 → 先建后断不可行，不再考虑
+                        continue
+                    ov = [w for w in visible_at(te) if w["sat"] != cur["sat"]]
+                    if not ov:
+                        continue
+                    bc = max(ov, key=lambda w: _score(w, te))
+                    gain = _vlong(bc, te) - _vlong(cur, te)
+                    rv = rem_srv / max(1e-9, los_true - connect_t)
+                    rvb, ncb = min(3, int(rv * 4)), min(2, len(ov))
+                    ok = 1 if gain >= _LAMBDA_HO else 0
+                    # Q 表记录该状态学到的最优动作（1=切），在线按奖励更新
+                    key = (rvb, ncb, 1)
+                    qtab[key] = qtab.get(key, 0.0) + _DQN_ALPHA * ((gain - _LAMBDA_HO) - qtab.get(key, 0.0))
+                    if ok and qtab.get(key, 0.0) > qtab.get((rvb, ncb, 0), 0.0):
+                        best_te = te
+                if best_te is not None:
+                    t_ho, forced = best_te, False
+                los_pred = t_ho
+
             overlap = [w for w in visible_at(los_pred)
                        if w["sat"] != cur["sat"] and w["aos_s"] <= t_ho + 1e-9]
             nxt = next_visible_after(los_pred)
 
-            if overlap:
-                cand = max(overlap, key=lambda w: _score(w, t_ho))
-                cur_score = _score(cur, t_ho)
-                if P["ho_hyst"] > 0 and _score(cand, t_ho) < cur_score + P["ho_hyst"]:
-                    break     # 迟滞：不切换，保持当前连接至结束
-                # ★审计修复 2026-09-02（第 2 轮）★：重叠候选在决策时刻 t_ho 已可见，
-                # 预测式「先建后断」应即刻执行建链（可连时刻 = t_ho），而非等到预测 LOS。
-                # 原 start_connect=los_pred 使 ho_lead 提前量被完全旁路：
-                # 中断 ≈ max(0, LOS 预测高估误差)，与反应式切换无差别，提前 20s 形同虚设。
-                start_connect = t_ho
-            elif nxt is not None:
-                cand = nxt
-                start_connect = nxt["aos_s"]      # 覆盖盲区：等待目标星升起后才可连
+            # ---- 候选确定（★T2 基线对比：5 策略 + 1 消融臂★）----
+            cand = None
+            start_connect = t_ho
+            if policy in ("predictive", "predictive_nopremig"):
+                if overlap:
+                    cand = max(overlap, key=lambda w: _score(w, t_ho))
+                    cur_score = _score(cur, t_ho)
+                    if P["ho_hyst"] > 0 and _score(cand, t_ho) < cur_score + P["ho_hyst"]:
+                        break     # 迟滞：不切换，保持当前连接至结束
+                    start_connect = t_ho
+                elif nxt is not None:
+                    cand = nxt
+                    start_connect = nxt["aos_s"]
+                else:
+                    break
+            elif policy == "graph":
+                # Graph-KM：负载感知最大权匹配（KM 单终端退化为加权 argmax）+ 滞回边 → 降切换次数。
+                # 权重 = 联合打分 − GRAPH_LOAD_PEN·(目标星负载占比)。负载占比归一到 [0,1]（除以终端总数），
+                # 使负载项 ≤ GRAPH_LOAD_PEN，与打分(0~1)同量纲、不喧宾夺主（原累加负载致权重爆炸→乒乓）。
+                # ★调查结论（2026-09-16）★:改用「瞬时负载 + 峰值归一」使该项真正 binding 后，Python 轨
+                # graph 中断 16.2→112.2 ms（最大 60.4 s）且与 ns-3 发散 → 判定净负面，已撤回（见文档）。
+                if overlap:
+                    _nt = max(1, n_terminals)
+                    def _gw(w):
+                        return _score(w, t_ho) - GRAPH_LOAD_PEN * min(1.0, sat_load.get(w["sat"], 0) / _nt)
+                    best_c = max(overlap, key=_gw)
+                    cur_w = _score(cur, t_ho) - GRAPH_LOAD_PEN * min(1.0, sat_load.get(cur["sat"], 0) / _nt)
+                    if forced or _gw(best_c) > cur_w + GRAPH_HYST:
+                        cand = best_c
             else:
+                # cho / rel17 / dqn：在决策时刻 t_ho 选最佳可见候选（先建后断）
+                if overlap:
+                    best_c = max(overlap, key=lambda w: _score(w, t_ho))
+                    cur_score = _score(cur, t_ho)
+                    rc = P["cho_cond"] if P["cho_cond"] > 0 else 0.05
+                    if forced or _score(best_c, t_ho) > cur_score + rc:
+                        cand = best_c
+            # 兜底：强制 LOS 末端仍无候选则接入下一颗可见星（真实覆盖空洞）
+            if cand is None and nxt is not None:
+                cand = nxt
+                start_connect = nxt["aos_s"]
+            if cand is None:
                 break
+            # ★Graph-KM 负载记账★：本终端接入目标星，负载 +1（供后续匹配的负载惩罚使用）
+            # ★调查结论（2026-09-16）★：曾改为「瞬时负载（离开 -1）+ 峰值归一」以使惩罚项 binding，
+            # 实证为**净负面**——Python 轨 graph 中断 16.2→112.2 ms（最大 60.4 s）、且与 ns-3 轨
+            # （15.25 ms）**发散**（负载状态随连接序列演化，一旦 binding 就放大两轨 RNG 差异）。
+            # 故撤回，保持「累积计数 / 终端总数」的弱归一；graph 定位为**近似实现**（见文档）。
+            sat_load[cand["sat"]] = sat_load.get(cand["sat"], 0) + 1
 
             # ---- D3 认证上下文星间预迁移（先建后断）----
             # 服务星在决策时刻 t_ho 将本终端认证上下文（pseudo + 当前计数器）经星间链路
@@ -577,10 +806,12 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             # ★P2 假名轮换★：每次切换 epoch 递增，信令假名随之轮换（前向不可关联）
             term_epoch[k] = term_epoch.get(k, 0) + 1
             pk = _auth.make_pseudo(root_key, k, term_epoch[k])
-            if P["pre_migrate"]:
+            # ★T2★：星间预迁移仅本职预测式拥有；反应式基线无此机制（对比公平性）
+            do_premigrate = P["pre_migrate"] and policy == "predictive"
+            if do_premigrate:
                 sat_ctx.setdefault(cand["sat"], {})[k] = \
                     sat_ctx.get(cur["sat"], {}).get(k, term_attempts[k] + 1)
-            has_ctx = k in sat_ctx.get(cand["sat"], {})
+            has_ctx = (k in sat_ctx.get(cand["sat"], {})) if do_premigrate else False
             # ★P2 哈希链续认证★：切换时终端出示哈希链下一跳，星上推进链头（单向防重放）
             if k in chain_state:
                 chain_state[k] = _auth.chain_next(chain_state[k])
@@ -649,6 +880,7 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             if ho_hist and (t_ho - ho_hist[-1][1]) < PINGPONG_MIN_GAP_S:
                 pingpong = 1
             ho_hist.append((cand["sat"], t_ho))
+            last_ho_t[k] = t_ho
 
             trace.append(_mk("HANDOVER", k, tag, t_ho, cur["sat"], cand["sat"],
                              round(interrupt * 1000.0, 3), ho_dop, ho_slant, ho_result,

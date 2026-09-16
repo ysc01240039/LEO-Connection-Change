@@ -17,7 +17,7 @@ import numpy as np
 from .config import DATA_DIR, SIM_START_UTC, TIME_STEP_S
 from .scenario import get_scenario
 from .data_sources import fetch_tle
-from .orbit import build_timescale
+from .orbit import build_timescale, snap_cell, GRID_N, GRID_STEP_DEG
 from skyfield.api import EarthSatellite
 
 NS3_IN = DATA_DIR / "ns3_in"
@@ -83,7 +83,12 @@ def gen_ephemeris(sats, ts, step_s, duration_s, out_csv):
 
 def gen_terminals(sc, out_csv, seed=42):
     """在灾害中心周围生成带危险度标签的终端分布。
-    返回终端列表 [(id, lat, lon, alt_m, tag)]。
+    返回终端列表 [(id, lat, lon, alt_m, tag, ci, cj)]。
+
+    ★方案A（2026-09-16）★：额外写入 cell_i / cell_j 两列——终端吸附到的 5×5 格点索引。
+    ns-3 轨据此直接取该格点的可见窗（读 grid_windows.csv），
+    与本轨 run_protocol(cell_windows=...) 严格同源，消除「Python 用中心点窗 / ns-3 用每终端窗」
+    导致的两轨可见性边界翻转（原 T2 残差②③④ 的共同根因）。
     """
     rnd = random.Random(seed)
     center_lat, center_lon, center_alt = sc["lat"], sc["lon"], sc["alt_m"]
@@ -103,12 +108,32 @@ def gen_terminals(sc, out_csv, seed=42):
         lon = center_lon + dlon
         alt = center_alt + rnd.uniform(-50, 200)
         tag = rnd.choices(tags, weights=weights, k=1)[0]
-        terms.append((i, round(lat, 6), round(lon, 6), round(alt, 1), tag))
+        ci, cj = snap_cell(lat, lon, center_lat, center_lon, GRID_STEP_DEG, GRID_N)
+        terms.append((i, round(lat, 6), round(lon, 6), round(alt, 1), tag, ci, cj))
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f, lineterminator="\n")
-        w.writerow(["term_id", "lat", "lon", "alt_m", "tag"])
+        w.writerow(["term_id", "lat", "lon", "alt_m", "tag", "cell_i", "cell_j"])
         w.writerows(terms)
     return terms
+
+
+def gen_grid_windows(cell_windows, out_csv):
+    """★方案A★ 把 Python 算出的 5×5 格点可见窗写成 CSV，供 ns-3 轨直接读取。
+
+    字段：cell_i, cell_j, sat_name, aos_s, los_s —— 两轨共用同一套窗，
+    使可见性判定在两条轨上逐字一致（ns-3 不再自行按每终端位置重算窗）。
+    返回写入的窗记录数。
+    """
+    n = 0
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, lineterminator="\n")
+        w.writerow(["cell_i", "cell_j", "sat_name", "aos_s", "los_s"])
+        for (ci, cj), wins in sorted(cell_windows.items()):
+            for win in wins:
+                w.writerow([ci, cj, win["sat"], round(float(win["aos_s"]), 3),
+                            round(float(win["los_s"]), 3)])
+                n += 1
+    return n
 
 
 def write_ns3_scenario(sc, prov, params, out_json):
@@ -137,6 +162,7 @@ def write_ns3_scenario(sc, prov, params, out_json):
         "rach_steps": sc.get("rach_steps", 2),
         "collision_on": sc.get("collision_on", False),
         "rach_capacity": sc.get("rach_capacity", 64),
+        "n_preamble": sc.get("n_preamble", 64),   # ★T3（2026-09-16）★ 前导码数（场景可覆盖，用于高冲突对照）
         "retry_interval_ms": sc.get("retry_interval_ms", 500.0),
         "retry_max": sc.get("retry_max", 20),
         "sat_eph_csv": "ephemeris.csv",
