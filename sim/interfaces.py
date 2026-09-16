@@ -34,13 +34,20 @@ def write_trace_csv(path, trace):
 
 
 def write_metrics_json(path, metrics, platform=None, commit=None,
-                       commit_full=None, run_id=None, scenario=None):
+                       commit_full=None, run_id=None, scenario=None,
+                       seed=None, auth_method=None):
     """写统计结果 JSON。
 
     ★ 存档合规（2026-09-16）★：自该日起在顶层注入《数据存档规范》§二要求的
     存档标签（platform / commit / run_id / scenario / produced_at），
     使结果文件本身即可定位仿真平台与代码版本。原有指标键完全不动，
     仅追加顶层字段，不影响任何下游读取与指标计算（纯格式，非方法修改）。
+
+    ★ 认证三档口径合规（2026-09-16）★：追加 seed 与 auth_method 顶层字段，
+    对齐《认证三档对比指标口径》§3「每次运行建议保留字段」。auth_method
+    当前固定为 "hmac_dual_root"（项目仅实现本方案，见 sim/auth.py；无认证 /
+    5G-AKA 未在仿真中实现，详见 results/AUTH_TIER_COMPLIANCE.md）。纯格式追加，
+    不改任何仿真方法。
     """
     out = dict(metrics)  # 浅拷贝，不污染调用方
     if platform is not None:
@@ -53,6 +60,10 @@ def write_metrics_json(path, metrics, platform=None, commit=None,
         out["run_id"] = run_id
     if scenario is not None:
         out["scenario"] = scenario
+    if seed is not None:
+        out["seed"] = seed
+    if auth_method is not None:
+        out["auth_method"] = auth_method
     out["produced_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)

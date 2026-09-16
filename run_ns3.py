@@ -234,6 +234,10 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
     _m["commit"] = _c
     _m["run_id"] = f"{scenario_key}_s{seed}_ns3_{stamp}"
     _m["scenario"] = scenario_key
+    # ★ 认证三档口径合规（2026-09-16）★：追加 seed / auth_method 对齐规范§3。
+    # 当前 ns-3 轨仅实现 HMAC 双根（与 Python 轨一致），auth_method 固定该值。
+    _m["seed"] = seed
+    _m["auth_method"] = "hmac_dual_root"
     _m["produced_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     (rundir / "metrics.json").write_text(
         json.dumps(_m, ensure_ascii=False, indent=2), encoding="utf-8")

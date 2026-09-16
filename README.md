@@ -565,3 +565,34 @@ python run_sim.py
 - `report.html` 元信息表已标注 运行标识 / 仿真平台 / 代码版本(commit) / 生成时间；
 - `coverage.png` / `handover.png` 标题追加 `[platform | run_id | commit]` 后缀。
 
+---
+
+## 12. 认证三档对比指标口径合规说明（2026-09-16）
+
+> 对照规范：`天权_认证三档对比指标口径.docx`（桌面）。本次仅做**格式/元数据合规与缺口核查**，
+> 未改动任何仿真方法（与 §11 同一纪律）。详细逐条对照见 `results/AUTH_TIER_COMPLIANCE.md`，
+> 三档结构化数据见 `results/auth_tier_comparison.json`，复现脚本见 `exp/archive_auth_tier.py`。
+
+### 12.1 三档方案现状
+| 方案 | 仿真可实现性 | 说明 |
+|---|---|---|
+| 无认证 | 未实现（仅逻辑基线） | 拦截率=0、时延=0；项目无「关闭认证」开关 |
+| 传统 5G-AKA | **不可达** | 需核心网 UDM（3GPP TS 33.501），违反 AGENTS.md §0.3 无核心网约束 |
+| 本方案 HMAC 双根 | **已实现并实测** | `sim/auth.py`，拦截率/时延真实可测 |
+
+### 12.2 核心指标（已对齐）
+- **伪造终端拦截率** = 密码层拦截 / 进入认证环节的伪造终端，实测均值 `0.832 ± 0.073`（n=307 含伪造终端 run）。
+- **认证时延** = `认证引入额外时延_ms`（HMAC 校验×星上降频），实测均值 `0.105 ± 0.015 ms`。
+  注：此为认证**引入的额外时延**，非完整认证往返；完整起止事件按规范备注待 A 组结合代码统一。
+
+### 12.3 每运行 9 字段（规范 §3，已补齐）
+`run_id` / `scenario` / `seed`† / `auth_method`† / `auth_latency_ms` / `fake_terminal_total` /
+`fake_terminal_blocked`† / `block_rate` / `git_commit` 均已具备。
+（† = 本次合规新增回填；`auth_latency_ms`/`fake_terminal_total`/`block_rate` 为既有中文指标的 1:1 英文映射。）
+
+### 12.4 关键缺口（诚实标注，非格式问题）
+1. **5G-AKA 不可仿真**：硬环境约束；如需该基线须引用 3GPP 文献值或放宽约束。
+2. **无认证仅逻辑基线**：真实「无认证」run 需加认证开关（方法改动，超出本次范围）。
+3. **三档 × 5 种子重复实验未跑**：需在 `run_sim.py` 增加 auth_method 遍历 + 5 种子，属实验设计任务。
+
+

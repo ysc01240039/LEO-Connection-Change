@@ -382,7 +382,8 @@ def main(scenario_key="wenchuan", group="oneweb", seed=20260901, reps=1,
     write_trace_csv(rundir / "access_trace.csv", last_trace)
     write_metrics_json(rundir / "metrics.json", metrics,
                        platform="python", commit=_git_commit(),
-                       run_id=tag, scenario=scenario_key)
+                       run_id=tag, scenario=scenario_key,
+                       seed=seed, auth_method="hmac_dual_root")
     (rundir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 

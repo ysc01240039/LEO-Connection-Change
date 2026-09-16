@@ -1,0 +1,55 @@
+{
+  "spec": "天权 · 认证三档对比实验指标口径",
+  "spec_file": "C:/Users/ASUS/Desktop/天权_认证三档对比指标口径.docx",
+  "generated_at": "2026-09-16T12:55:20.795026Z",
+  "schemes": {
+    "hmac_dual_root": {
+      "available": true,
+      "implemented": true,
+      "source": "sim/auth.py（HMAC-SHA256 双根，真实校验）",
+      "block_rate": {
+        "mean": 0.8322,
+        "stdev": 0.0728,
+        "n": 307
+      },
+      "auth_latency_ms": {
+        "mean": 0.1048,
+        "stdev": 0.0147,
+        "n": 307
+      },
+      "note": "本方案实测；block_rate=密码层拦截/进入认证环节的伪造终端，auth_latency_ms=认证引入额外时延(HMAC校验×星上降频)。聚合自 307 个含伪造终端的 HMAC run（跨多场景，非单条件5种子重复）。"
+    },
+    "no_auth": {
+      "available": true,
+      "implemented": false,
+      "logical_baseline": true,
+      "block_rate": {
+        "mean": 0.0,
+        "stdev": 0.0,
+        "n": 0
+      },
+      "auth_latency_ms": {
+        "mean": 0.0,
+        "stdev": 0.0,
+        "n": 0
+      },
+      "note": "逻辑基线：无认证则不存在拦截、亦无认证时延。项目未实现「关闭认证」开关，未单独仿真该方案；列为理论基线供对照。"
+    },
+    "5g_aka": {
+      "available": false,
+      "implemented": false,
+      "reason": "传统 5G-AKA 依赖核心网 UDM 校验并需多轮交互（3GPP TS 33.501），违反 AGENTS.md §0.3『无核心网』环境约束，纯仿真不可达；本对照方法/数据任务超出本次「格式合规」范围，待人/A 组决策。"
+    }
+  },
+  "per_run_field_mapping": {
+    "run_id": "✅ 既有(manifest/metrics)",
+    "scenario": "✅ 既有",
+    "seed": "✅ 本次新增回填(metrics 顶层)",
+    "auth_method": "✅ 本次新增回填(metrics 顶层, 固定 hmac_dual_root)",
+    "auth_latency_ms": "✅ 映射 认证引入额外时延_ms",
+    "fake_terminal_total": "✅ 映射 伪造终端数",
+    "fake_terminal_blocked": "✅ 本次新增(伪造终端拦截数)",
+    "block_rate": "✅ 映射 伪造终端拦截率",
+    "git_commit": "✅ 既有(存档合规注入)"
+  }
+}
