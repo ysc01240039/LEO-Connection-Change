@@ -123,6 +123,12 @@ def compute_metrics(trace: list, summary: dict | None = None) -> dict:
         m["伪造终端拦截率"] = round(blocked / auth_seen, 4) if auth_seen else 0.0
         m["伪造终端漏检率"] = round(missed / auth_seen, 4) if auth_seen else 0.0
         m["伪造终端拥塞未认证数"] = n_cont
+        # ---- ★认证三档口径合规（2026-09-16，纯输出字段，1:1 映射，不算法改动）★
+        # 对齐《认证三档对比指标口径》§3 每运行保留字段：block_rate /
+        # fake_terminal_total / fake_terminal_blocked。原中文键保留不动。
+        m["fake_terminal_blocked"] = blocked
+        m["fake_terminal_total"] = nf
+        m["block_rate"] = m["伪造终端拦截率"]
     if legit:
         fr = sum(1 for e in legit if e.get("result") == "fail"
                  and e.get("auth_result") in ("bad_mac", "replay", "false_reject"))
@@ -130,6 +136,9 @@ def compute_metrics(trace: list, summary: dict | None = None) -> dict:
 
     if summary:
         m["认证引入额外时延_ms"] = summary.get("auth_extra_ms", 0.0)
+        # ★认证三档口径合规★：auth_latency_ms 对齐规范§3（项目记录的是认证引入的
+        # 额外时延，即星上 HMAC 校验耗时×降频；完整认证往返起止事件定义待 A 组统一）。
+        m["auth_latency_ms"] = summary.get("auth_extra_ms", 0.0)
         if summary.get("n_forged"):
             m["伪造终端总数(抽样)"] = summary["n_forged"]
         if summary.get("geom_fail"):

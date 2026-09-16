@@ -507,3 +507,92 @@ python run_sim.py
 
 # 全部对照/消融/敏感性命令见第八节 8.4；ns-3 轨构建见 docs/ns3构建说明.md
 ```
+
+---
+
+## 11. 存档规范合规说明（2026-09-16）
+
+本工程遵循《天权项目计算机仿真实验数据存档规范（初步定稿）》。所有整改均为
+**格式 / 元数据 / 存档合规**层，**未改动任何仿真方法、协议状态机或指标计算公式**
+（RACH / 认证 / 切换 / 评估逻辑不变）。逐条对照见 `results/ARCHIVE_COMPLIANCE.md`。
+
+### 11.1 结果文件存档标签（规范 §二）
+- 每个结果 JSON 顶层已注入 `platform` / `commit` / `run_id` / `scenario` / `produced_at`：
+  - 历史文件由 `exp/archive_compliance.py` 回填（幂等）；
+  - 新运行由 `sim/interfaces.py:write_metrics_json` 与 `run_ns3.py` 写 `metrics.json` 处
+    自动注入（持久化修复）。
+- 文件名沿用历史命名（如 `wenchuan_metrics.json`）；`results/summary_20260903.json`
+  为规范原文明确的「现阶段」例外（前端直接读取）。规范命名映射登记于 `docs/实验台账.md`
+  与台账 `results/experiment_ledger.json`，未物理重命名以免破坏既有引用。
+
+### 11.2 实验台账（规范 §三）
+- `docs/实验台账.md` + `results/experiment_ledger.json`：聚合全部 run 的 §三 必填字段
+  （run_id / 场景 / platform / commit / 配置校验值 / 种子 / TLE 来源版本 / 终端规模与突发强度
+  / 起止时间 / 环境 / 输出路径 / 状态异常）。台账 `commit` 与各 run `manifest.git_commit` 一致。
+- `end_time` 与 `anomalies` 原 `manifest` 未落盘，记为 null（待运行框架补充）。
+
+### 11.3 指标分组（规范 §三：全局 / 高危区域 / 盲区终端）
+- `results/subgroup_metrics.json`（由 `exp/archive_subgroups.py` 生成，只读现有 trace）：
+  - **全局**：全部 ACCESS 事件。
+  - **高危区域**：按规范「同时刻(floor t_s)接入请求数 > 单星容量(rach_capacity) 80%」分箱；
+    容量取各 run `manifest.scenario_config.rach_capacity`。
+  - **盲区终端**：规范按 `elevation_deg < 25` 判定；本工程 **Python 轨未在 trace 中持久化逐终端
+    仰角**，`access_trace.csv` 无 elevation 字段 → 按规范 §二「缺失值规则」标 `null`，
+    不伪造。盲区分组需扩展 `sim/` 落盘仰角后方可计算（属后续增强，非本次合规缺口的错填）。
+- 接入指标含：平均/P95 时延、成功率、RACH 吞吐、伪造终端拦截率、认证开销（认证开销未落盘→null）。
+
+### 11.4 缺失值规则（规范 §二）
+- 不可由仿真产生的终端属性（如盲区仰角）一律标 `null` 并此处说明，不省略、不伪造。
+- 现有布尔字段（`forged` / `pingpong`）均为数值 0/1，**非字符串** true/false，符合规范。
+
+### 11.5 高危定义口径说明（规范 §三 vs 本项目）
+- 规范高危区域 = 「请求数 > 单星容量 80%」或「终端密度 > 全局 95 分位」（负载/密度视角）。
+- 本项目 `risk_level`（`tag` = high/med/low）= **生存优先分级**（指挥/灾情/报平安人群），
+  属设计语义，非负载阈值；两者不冲突，分别为不同维度的「高危」判定。
+  规范负载口径的高危分组见 11.3（`high_risk_by_load`），生存优先分级见 `results/` 各指标与
+  `premigrate_comparison.json` 等。
+
+### 11.6 重复实验次数（规范 §三）
+- 归档 `data/sim/runs/` 共 308+ 次运行，单场景远超 10 次（如 wenchuan 家族 180+ 次）。
+- 用于报告/答辩的正式对比建议使用多种子均值与置信区间，可由 `run_sim.py` 的多种子对比流程
+  与 `perf/` 脚本复算；当前 `results/summary_20260903.json` 以代表种子（20260901）快照呈现。
+
+### 11.7 融合组网指标（规范 §三）
+- 融合组网（覆盖率 / 接入成功率 / 空基增益）属 T9 空基扩展层，**v1 默认关闭**，记为 **N/A**。
+  开通空基后的三配置对比实验将补充该组指标。
+
+### 11.8 图表标注（规范 §三）
+- `report.html` 元信息表已标注 运行标识 / 仿真平台 / 代码版本(commit) / 生成时间；
+- `coverage.png` / `handover.png` 标题追加 `[platform | run_id | commit]` 后缀。
+
+---
+
+## 12. 认证三档对比指标口径合规说明（2026-09-16）
+
+> 对照规范：`天权_认证三档对比指标口径.docx`（桌面）。本次仅做**格式/元数据合规与缺口核查**，
+> 未改动任何仿真方法（与 §11 同一纪律）。详细逐条对照见 `results/AUTH_TIER_COMPLIANCE.md`，
+> 三档结构化数据见 `results/auth_tier_comparison.json`，复现脚本见 `exp/archive_auth_tier.py`。
+
+### 12.1 三档方案现状
+| 方案 | 仿真可实现性 | 说明 |
+|---|---|---|
+| 无认证 | 未实现（仅逻辑基线） | 拦截率=0、时延=0；项目无「关闭认证」开关 |
+| 传统 5G-AKA | **不可达** | 需核心网 UDM（3GPP TS 33.501），违反 AGENTS.md §0.3 无核心网约束 |
+| 本方案 HMAC 双根 | **已实现并实测** | `sim/auth.py`，拦截率/时延真实可测 |
+
+### 12.2 核心指标（已对齐）
+- **伪造终端拦截率** = 密码层拦截 / 进入认证环节的伪造终端，实测均值 `0.832 ± 0.073`（n=307 含伪造终端 run）。
+- **认证时延** = `认证引入额外时延_ms`（HMAC 校验×星上降频），实测均值 `0.105 ± 0.015 ms`。
+  注：此为认证**引入的额外时延**，非完整认证往返；完整起止事件按规范备注待 A 组结合代码统一。
+
+### 12.3 每运行 9 字段（规范 §3，已补齐）
+`run_id` / `scenario` / `seed`† / `auth_method`† / `auth_latency_ms` / `fake_terminal_total` /
+`fake_terminal_blocked`† / `block_rate` / `git_commit` 均已具备。
+（† = 本次合规新增回填；`auth_latency_ms`/`fake_terminal_total`/`block_rate` 为既有中文指标的 1:1 英文映射。）
+
+### 12.4 关键缺口（诚实标注，非格式问题）
+1. **5G-AKA 不可仿真**：硬环境约束；如需该基线须引用 3GPP 文献值或放宽约束。
+2. **无认证仅逻辑基线**：真实「无认证」run 需加认证开关（方法改动，超出本次范围）。
+3. **三档 × 5 种子重复实验未跑**：需在 `run_sim.py` 增加 auth_method 遍历 + 5 种子，属实验设计任务。
+
+

@@ -158,5 +158,11 @@
       "伪造终端拦截率": 0.5098,
       "伪造终端漏检率": 0.4902
     }
-  ]
+  ],
+  "platform": "python",
+  "commit": "d260720",
+  "commit_full": "d260720552d21c246c534ab2434f17a3871b3129",
+  "scenario": "sensitivity",
+  "produced_at": "2026-09-16T12:27:43.669837Z",
+  "_archive": "injected by exp/archive_compliance.py per 《数据存档规范》§二"
 }

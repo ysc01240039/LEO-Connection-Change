@@ -206,5 +206,11 @@
     "加权阻塞率(中低危)": 0.3508,
     "dp平均高危预留": 1.0,
     "dp高危QoS上界": 0.12
-  }
+  },
+  "platform": "python+ns3",
+  "commit": "d260720",
+  "commit_full": "d260720552d21c246c534ab2434f17a3871b3129",
+  "scenario": "all(汇总)",
+  "produced_at": "2026-09-16T12:27:43.666634Z",
+  "_archive": "injected by exp/archive_compliance.py per 《数据存档规范》§二"
 }
