@@ -41,6 +41,33 @@ def _geometry(diff, t):
     return round(dop, 1), round(slant, 1), round(delay * 1000.0, 2)
 
 
+# ★方案A（2026-09-16）★ 网格窗：以场景中心 ± (n//2)·step 的方区取格点中心，各算可见窗。
+# 两轨把终端**吸附**到最近格点（round((lat-clat)/step)）后共用该格点的窗 →
+# 窗集只依赖格点中心（两轨共享同一 center/step/n），故 Python 与 ns-3 的可见性**严格一致**。
+GRID_N = 5          # 每边格点数（5×5=25）
+GRID_STEP_DEG = 0.3  # 格点间距(°)（±0.6° ≈ 覆盖 spread_deg=0.6 的方区）
+
+
+def snap_cell(lat, lon, clat, clon, step_deg=GRID_STEP_DEG, n=GRID_N):
+    """终端 → 最近格点 (i, j)，i/j ∈ [-n//2, n//2]。"""
+    h = n // 2
+    i = int(round((lat - clat) / step_deg)); i = max(-h, min(h, i))
+    j = int(round((lon - clon) / step_deg)); j = max(-h, min(h, j))
+    return i, j
+
+
+def compute_grid_windows(sats, clat, clon, alt_m, ts,
+                         step_deg=GRID_STEP_DEG, n=GRID_N):
+    """返回 {(i,j): windows}，键为格点索引；窗内容同 compute_access。"""
+    h = n // 2
+    out = {}
+    for i in range(-h, h + 1):
+        for j in range(-h, h + 1):
+            w, _ = compute_access(sats, clat + i * step_deg, clon + j * step_deg, alt_m, ts)
+            out[(i, j)] = w
+    return out
+
+
 def compute_access(sats, lat, lon, alt_m, ts):
     """返回每颗星的可见时间窗（真实计算）：
     [{'sat','aos_s','los_s','max_el','dur_s','doppler_max_hz','slant_km','delay_ms'}, ...]

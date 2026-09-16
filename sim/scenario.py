@@ -52,6 +52,60 @@ SCENARIOS = {
         "ho_hyst": 0.0,
         "note": "呼叫风暴：1s 内 1200 终端涌入，10ms 时间片仅 4 前导码 → 碰撞/拥塞显现",
     },
+    # ---- T3 容量不受限对照（★2026-09-16★）----
+    # 动因：窄带场景（rach_capacity=4）下 msgarep 的 ×M=4 资源开销抵消其副本分集增益，
+    # 三方案成功率被「资源效率」主导，论文方法的本意（副本分集降低回退四步概率）看不出来。
+    # 本场景把 rach_capacity 提高 64×（256），使**容量不再 binding**、失败只来自前导冲突
+    # → 可观察 msgarep 相对 rel17_4step 的分集增益（二者均存在 MsgA/Msg1 前导冲突）。
+    # 其余参数与 wenchuan_storm2 完全一致，保证对照只反映「容量」这一个变量。
+    "wenchuan_storm2_wide": {
+        "name": "汶川地震灾区（呼叫风暴·容量不受限对照）",
+        "lat": 31.0083, "lon": 103.5833, "alt_m": 1326,
+        "terminals": 1200,
+        "burst_start_s": 5,
+        "burst_ramp_s": 1,
+        "access_proc_ms": 3.0,
+        "danger_tags": {"high": 0.20, "med": 0.35, "low": 0.45},
+        "forged_ratio": 0.05,
+        "compromised_share": 0.15,
+        "rach_steps": 2,
+        "collision_on": True,
+        "rach_capacity": 256,             # ★容量不受限★：隔离「资源效率」与「分集增益」两个变量
+        "retry_interval_ms": 500.0,
+        "retry_max": 3,
+        "ho_hyst": 0.0,
+        "note": "与 wenchuan_storm2 同负载，仅 rach_capacity 4→256：容量不 binding，"
+                "失败只来自前导冲突 → msgarep 副本分集增益可见（论文本意的公平对照）",
+    },
+    # ---- T3 高冲突对照（★2026-09-16★）----
+    # 动因：`wenchuan_storm2_wide`（容量不受限）下三方案成功率**均为 1.0**——说明 1200 终端/1s 与
+    # 64 前导码的组合下**前导冲突也不 binding**。本场景把前导码降到 8，使前导冲突成为主导失败源。
+    # ★实测结论（与预期相反，据实记录）★：msgarep 成功率**低于** rel17_4step
+    #   （0.8025/0.7651 vs 0.9561/0.9424，双轨一致）。原因：本项目对副本分集采用**忠实资源记账**
+    #   （M=4 份副本各占**独立**前导资源，见 `sim/protocol.py` 的 `_preamble_contend(force=True)` 与
+    #   `RACH_SLOT_UNITS`）——副本的**资源外部性**（多占 4 份前导，加剧全体冲突）抵消了其**分集增益**。
+    # 即：Kim et al. (WCL 2025) 的机制在「副本各占独立资源」这一忠实解释下，于本模型/本负载区间不占优。
+    # 注：n_preamble 为**场景可覆盖**参数（原为 config 常量），仅用于隔离冲突这一个变量。
+    "wenchuan_storm2_contend": {
+        "name": "汶川地震灾区（呼叫风暴·高冲突对照）",
+        "lat": 31.0083, "lon": 103.5833, "alt_m": 1326,
+        "terminals": 1200,
+        "burst_start_s": 5,
+        "burst_ramp_s": 1,
+        "access_proc_ms": 3.0,
+        "danger_tags": {"high": 0.20, "med": 0.35, "low": 0.45},
+        "forged_ratio": 0.05,
+        "compromised_share": 0.15,
+        "rach_steps": 2,
+        "collision_on": True,
+        "rach_capacity": 256,             # 容量不受限（隔离「资源效率」变量）
+        "n_preamble": 8,                  # ★高冲突★：每时隙仅 8 前导码，使前导冲突成为主导失败源
+        "retry_interval_ms": 500.0,
+        "retry_max": 3,
+        "ho_hyst": 0.0,
+        "note": "容量不受限 + 前导码 8：隔离「前导冲突」变量。实测 msgarep 成功率低于 rel17_4step"
+                "（0.80/0.77 vs 0.96/0.94）——副本各占独立前导的资源外部性抵消其分集增益",
+    },
     "wenchuan_storm2_lowhigh": {
         "name": "汶川灾区（低高危负载·回收对照）",
         "lat": 31.0083, "lon": 103.5833, "alt_m": 1326,

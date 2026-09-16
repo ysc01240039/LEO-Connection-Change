@@ -26,7 +26,7 @@ from sim.config import (DATA_DIR, MASK_ANGLE_DEG, SIM_DURATION_S, TIME_STEP_S,
                         ACCESS_PROC_MS, AUTH_CPU_DERATE, PRIORITY_RESERVE_FRAC)
 from sim.scenario import get_scenario
 from sim.data_sources import fetch_tle
-from sim.orbit import build_timescale
+from sim.orbit import build_timescale, compute_grid_windows
 from sim import ns3_io
 from sim import auth as _auth
 from sim.eval import compute_metrics
@@ -43,7 +43,9 @@ def win2wsl(p: str) -> str:
 def parse_args(argv):
     args = {"seed": 20260901, "no_viz": False, "ephem_err": None,
             "ho_lead": None, "w_el": None, "w_dwell": None, "hyst": None,
-            "compromised": None, "prio_mode": None}
+            "compromised": None, "prio_mode": None,
+            "ho_policy": "predictive", "elev_th": None, "cho_cond": None,
+            "cho_ttt": None, "t8": None, "rach_scheme": None}
     pos, i = [], 0
     while i < len(argv):
         a, nxt = argv[i], (argv[i + 1] if i + 1 < len(argv) else None)
@@ -61,6 +63,18 @@ def parse_args(argv):
             args["hyst"] = float(nxt); i += 2
         elif a == "--compromised" and nxt:
             args["compromised"] = float(nxt); i += 2
+        elif a == "--ho-policy" and nxt:
+            args["ho_policy"] = nxt; i += 2
+        elif a == "--elev-th" and nxt:
+            args["elev_th"] = float(nxt); i += 2
+        elif a == "--cho-cond" and nxt:
+            args["cho_cond"] = float(nxt); i += 2
+        elif a == "--cho-ttt" and nxt:
+            args["cho_ttt"] = float(nxt); i += 2
+        elif a == "--t8" and nxt:
+            args["t8"] = (nxt in ("1", "true", "on")); i += 2
+        elif a == "--rach-scheme" and nxt:
+            args["rach_scheme"] = nxt; i += 2
         elif a == "--prio-mode" and nxt:
             args["prio_mode"] = nxt; i += 2
         elif a == "--no-viz":
@@ -71,7 +85,8 @@ def parse_args(argv):
 
 
 def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = False,
-         seed: int = 20260901, overrides=None):
+         seed: int = 20260901, overrides=None, ho_policy="predictive", elev_th=None,
+         cho_cond=None, cho_ttt=None, t8_priority_on=None, rach_scheme=None):
     ov = {k: v for k, v in (overrides or {}).items() if v is not None}
     print(f"[1/5] 生成真实输入（TLE -> ECEF 星历 + 终端分布）")
     sc = get_scenario(scenario_key)
@@ -88,6 +103,21 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
     hyst = ov.get("hyst", sc.get("ho_hyst", 0.0))
     compromised = ov.get("compromised", sc.get("compromised_share", 0.15))
     pm = ov.get("prio_mode", sc.get("priority_mode", "dp"))  # ★科学版 dp★ 调度模式透传（默认 dp，与 Python 轨对齐）
+    # ★T2 切换基线对比★：切换策略与反应式参数透传（与 Python 轨 run_sim.py 同参）
+    # ★修复（2026-09-15）★：原写法从 ov.get(...) 取这些参数，但 ov 仅含
+    # ephem_err/ho_lead/w_el/w_dwell/hyst/compromised/prio_mode，不含 ho_policy 等，
+    # 导致 --ho-policy 等 CLI 参数被静默丢弃、4 策略 ns-3 全部回退 predictive，
+    # 双轨对照失效。现改为直接用 main() 入参（CLI 已解析），再以场景级为兜底。
+    ho_policy = ho_policy if ho_policy is not None else sc.get("ho_policy", "predictive")
+    # ★T3★ 接入方案：显式给定优先；否则由场景 rach_steps 推导（镜像 Python）
+    rach_scheme = (rach_scheme if rach_scheme is not None
+                   else sc.get("rach_scheme")
+                   or ("rel17_4step" if sc.get("rach_steps", 2) >= 4 else "twostep_precomp"))
+    elev_th = elev_th if elev_th is not None else sc.get("elev_th", 10.0)
+    cho_cond = cho_cond if cho_cond is not None else sc.get("cho_cond", 0.0)
+    cho_ttt = cho_ttt if cho_ttt is not None else sc.get("cho_ttt", 0.0)
+    t8 = t8_priority_on if t8_priority_on is not None else sc.get("t8_priority_on", True)
+    pre_migrate = 1 if sc.get("pre_migrate", True) else 0
     auth_extra_ms = _auth.measure_verify_ms() * AUTH_CPU_DERATE
     params = dict(mask_deg=MASK_ANGLE_DEG, sim_duration_s=SIM_DURATION_S,
                   time_step_s=TIME_STEP_S,
@@ -101,8 +131,13 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
     ns3_io.gen_ephemeris(sats, ts, params["time_step_s"], params["sim_duration_s"],
                          ns3_io.NS3_IN / "ephemeris.csv")
     ns3_io.gen_terminals(sc, ns3_io.NS3_IN / "terminals.csv", seed=seed)
+    # ★方案A（2026-09-16）★：把 5×5 格点可见窗写入输入目录，ns-3 轨直接读取 →
+    # 两轨可见窗逐字一致（消除「Python 中心窗 / ns-3 每终端窗」导致的中断尾部与切换次数差异）。
+    _cw = compute_grid_windows(sats, sc["lat"], sc["lon"], sc["alt_m"], ts)
+    _nw = ns3_io.gen_grid_windows(_cw, ns3_io.NS3_IN / "grid_windows.csv")
     ns3_io.write_ns3_scenario(sc, prov, params, ns3_io.NS3_IN / "scenario.json")
-    print(f"      卫星 {len(sats)} 颗 · 终端 {sc['terminals']} 个 · 星历已写 · seed={seed}")
+    print(f"      卫星 {len(sats)} 颗 · 终端 {sc['terminals']} 个 · 星历/网格窗已写"
+          f"（{len(_cw)} 格点 / {_nw} 窗）· seed={seed}")
 
     print(f"[2/5] 调用 WSL 运行 ns-3 离散事件仿真 ...")
     indir = win2wsl(str(ns3_io.NS3_IN))
@@ -134,7 +169,10 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
         f"--compromisedShare={compromised} --rngSeed={seed} "
         f"--eirpDbm={EIRP_DBM} --gtDbiK={GT_DBI_K} --bitRateBps={BIT_RATE_BPS} "
         f"--rarWindowMs={RAR_WINDOW_MS} --contTimerMs={CONTENTION_TIMER_MS} "
-        f"--nPreamble={N_PREAMBLE} --linkModelOn=1\""
+        f"--nPreamble={sc.get('n_preamble', N_PREAMBLE)} "
+        f"--hoPolicy={ho_policy} --elevTh={elev_th} --choCond={cho_cond} --choTtt={cho_ttt} "
+        f"--rachScheme={rach_scheme} "
+        f"--t8PriorityOn={1 if t8 else 0} --preMigrate={pre_migrate} --linkModelOn=1\""
     )
     run_cmd = f'wsl -d Ubuntu-24.04 -- bash -c "{inner}"'
     # ★审计修复：fail-fast★ —— WSL/ns-3 失败必须终止，禁止静默使用旧 trace 冒充新结果
@@ -205,4 +243,7 @@ if __name__ == "__main__":
     sk = pos[0] if len(pos) > 0 else "wenchuan"
     gp = pos[1] if len(pos) > 1 else "oneweb"
     ov = {k: args[k] for k in ("ephem_err", "ho_lead", "w_el", "w_dwell", "hyst", "compromised", "prio_mode")}
-    main(sk, gp, no_viz=args["no_viz"], seed=args["seed"], overrides=ov)
+    main(sk, gp, no_viz=args["no_viz"], seed=args["seed"], overrides=ov,
+         ho_policy=args["ho_policy"], elev_th=args["elev_th"], cho_cond=args["cho_cond"],
+         cho_ttt=args["cho_ttt"], t8_priority_on=args["t8"],
+         rach_scheme=args["rach_scheme"])

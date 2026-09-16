@@ -50,6 +50,11 @@ static std::map<uint32_t, std::vector<Ecef>> g_eph;     // satNodeId -> 轨迹(k
 static std::map<uint32_t, double>                 g_stepDt; // satNodeId -> 采样步长(s)
 static std::map<uint32_t, Ecef>                  g_termPos; // termNodeId -> ECEF(km)
 static std::map<uint32_t, std::vector<Window>>   g_termWins; // termNodeId -> 可见窗
+// ★方案A（2026-09-16）★ 网格窗：终端吸附到 5×5 格点，取该格点的可见窗（由 Python 写入
+// grid_windows.csv）。两轨共用同一套窗 → 可见性判定逐字一致，消除原「Python 用场景中心点窗、
+// ns-3 用每终端窗」造成的中断尾部/切换次数差异（T2 残差②③④ 的共同根因）。
+static std::map<uint32_t, std::pair<int,int>>    g_termCell; // termNodeId -> 吸附格点(i,j)
+static std::map<std::pair<int,int>, std::vector<Window>> g_cellWins; // 格点 -> 可见窗
 static std::map<uint32_t, Ptr<LeoApp>>           g_apps;     // nodeId -> App
 static NodeContainer                            g_satNodes;  // 卫星节点容器
 static std::map<uint32_t, uint32_t>             g_satId2Idx; // satNodeId -> 索引
@@ -66,6 +71,10 @@ static double g_simDur = 3600.0;
 // ---- T4 认证 / RACH 基线 / 碰撞拥塞（与 Python 轨 scenario.py 同参）----
 static double     g_authExtraMs    = 0.0;    // 星上轻量凭证校验额外时延(ms，实测折算)
 static uint32_t   g_rachSteps      = 2;      // 2=两步预补偿；4=Rel-17 四步基线
+// ★T3 接入方案（逐项镜像 sim/protocol.py）★
+static std::string g_rachScheme    = "twostep_precomp"; // rel17_4step | twostep_precomp | msgarep_2step
+static uint32_t   g_rachUnits      = 1;    // ★T3★ 本方案单次接入占用容量单位（2步=1 / 4步=2 / 副本=M）
+static const uint32_t kMsgArepM    = 4;      // MsgA 副本数（Kim et al., IEEE WCL 2025）
 static double     g_forgedRatio    = 0.0;    // 伪造终端占比
 static double     g_compromisedShare = 0.15; // 伪造终端中持有效密钥比例（→漏检率）
 static bool       g_collisionOn    = false;  // 碰撞/拥塞模型开关
@@ -77,6 +86,25 @@ static double     g_ephemErrS      = 0.0;    // 星历预测误差 σ(s)：0=完
 static double     g_wEl            = 0.5;    // 选星仰角权重
 static double     g_wDwell         = 0.5;    // 选星驻留权重
 static double     g_hoHyst         = 0.0;    // 切换迟滞（score 单位）
+// ---- ★T2 切换基线对比（★镜像 sim/protocol.py ho_policy★）----
+// predictive=本职预测式（先建后断+星间预迁移）；elevation/hysteresis/cho=三种反应式基线
+// （无预迁移、按各自真实触发语义在 LOS 段内决策），用于公平对照。
+static std::string g_hoPolicy      = "predictive"; // predictive | predictive_nopremig | cho | rel17 | dqn | graph
+                                                   // （5 基线对比矩阵 + 1 消融臂；nopremig=同提前量但关闭星间预迁移）
+static double     g_elevTh         = 10.0;   // 仰角阈值硬切换触发门限(度)（已弃用，保留兼容）
+static double     g_choCond        = 0.0;    // 3GPP 条件切换(CHO) 条件阈值(score 单位)
+static double     g_choTtt         = 0.0;    // 3GPP 条件切换 TTT(s)
+static uint32_t   g_nTerms         = 1200;   // 终端总数（Graph-KM 负载归一）
+// ★调查结论（2026-09-16）★：曾把语义改为「瞬时负载（离开 -1）+ 峰值归一」以使惩罚项 binding，
+// 实测净负面（Python 轨中断 16.2→112.2ms、最大 60.4s，且与 ns-3 轨发散）→ 已撤回，保持累积语义。
+static std::map<uint32_t,int> g_satLoad;     // Graph-KM 负载记账：sat -> 累计承载终端数
+// ★T2 基线算法参数（逐项镜像 sim/protocol.py）★
+static const double kLambdaHo     = 0.25;    // DQN 奖励中切换成本权重
+static const double kTSafe        = 5.0;     // DQN 先建后断安全提前量(s)
+static const double kGraphLoadPen = 0.15;    // Graph-KM 负载均衡启发权重
+static const double kGraphHyst    = 0.20;    // Graph-KM 滞回边（★与 Python GRAPH_HYST 一致★）
+static int32_t    g_t8PriorityOn   = 1;      // T8 业务感知切换开关（镜像 Python t8_priority_on）
+static const double REACT_MIN_GAP_S = 2.0;    // 反应式切换最小间隔(s)（★镜像 sim/protocol.py REACT_MIN_GAP_S★）
 static uint32_t   g_rarWindowMs    = 160.0;  // 四步 RAR 响应窗口(ms)
 static uint32_t   g_contTimerMs    = 200.0;  // 四步竞争解决定时器(ms)
 static uint32_t   g_nPreamble      = 64;     // 前导码数量（四步竞争）
@@ -281,14 +309,18 @@ static void dpRecompute(uint32_t sat){
   g_dpNGuard += 1;
 }
 
-static bool slotOk(uint32_t satId, double t, uint32_t prio){
+// ★T3（2026-09-16）★ units = 本接入方案单次占用的容量单位数
+// （2步=1 / 4步=2（Msg1+Msg3） / 副本分集=M）——镜像 sim/protocol.py 的 RACH_SLOT_UNITS，
+// 使拥塞场景下的可受理终端数与接入方案相关（否则成功率只由容量上限决定、与方案无关）。
+static bool slotOk(uint32_t satId, double t, uint32_t prio, uint32_t units = 1){
+  if (units < 1) units = 1;
   if (!g_collisionOn) return true;
   uint32_t slot10 = (uint32_t)(t / 0.01);
   if (!g_priorityOn){
     auto key = std::make_pair(satId, slot10);
     uint32_t used = g_slotLoad.count(key) ? g_slotLoad[key] : 0;
-    if (used >= g_rachCapacity) return false;
-    g_slotLoad[key] = used + 1;
+    if (used + units > g_rachCapacity) return false;
+    g_slotLoad[key] = used + units;
     return true;
   }
   if (g_priorityMode == "dp"){
@@ -315,11 +347,11 @@ static bool slotOk(uint32_t satId, double t, uint32_t prio){
     if (git != g_dpGuards.end()){ gh = git->second.first; gm = git->second.second; }
     uint32_t occ = g_dpOcc.count({satId, slot10}) ? g_dpOcc[{satId, slot10}] : 0;
     bool ok;
-    if      (prio == 0) ok = occ < g_rachCapacity;
-    else if (prio == 1) ok = occ < g_rachCapacity - (uint32_t)gh;
-    else                ok = occ < g_rachCapacity - (uint32_t)gh - (uint32_t)gm;
+    if      (prio == 0) ok = occ + units <= g_rachCapacity;
+    else if (prio == 1) ok = occ + units <= g_rachCapacity - (uint32_t)gh;
+    else                ok = occ + units <= g_rachCapacity - (uint32_t)gh - (uint32_t)gm;
     if (ok){
-      g_dpOcc[{satId, slot10}] = occ + 1;
+      g_dpOcc[{satId, slot10}] = occ + units;
       // 回收计数：med/low 落入高危预留区 [c-gh, c) → 闲置预留被复用
       if (prio != 0 && occ >= g_rachCapacity - (uint32_t)gh)
         g_dpReclaim[satId] = g_dpReclaim.count(satId) ? g_dpReclaim[satId] + 1 : 1;
@@ -336,7 +368,7 @@ static bool slotOk(uint32_t satId, double t, uint32_t prio){
   for (uint32_t p = prio; p < 3; ++p){
     auto key = std::make_pair(satId, slot10);
     uint32_t used = g_slotP[p].count(key) ? g_slotP[p][key] : 0;
-    if (used < cap[p]){ g_slotP[p][key] = used + 1; return true; }
+    if (used + units <= cap[p]){ g_slotP[p][key] = used + units; return true; }
   }
   return false;
 }
@@ -595,6 +627,8 @@ public:
   // ★审计修复★：伪造终端分两类——盲伪造（无密钥，MAC 随机）与密钥泄露（持有效 key，
   // 密码层不可检出 → 漏检）。原实现仅一个自报布尔。
   void SetForged(bool f, bool compromised){ m_forged = f; m_compromised = compromised; }
+  // ★T8 业务感知切换（★镜像 Python service_type★）：voice/image/sms 决定预测提前量冗余
+  void SetService(const std::string& svc){ m_service = svc; }
   // 终端初始化凭证（合法终端与密钥泄露型伪造终端持有效 dev_key）
   void InitCredential(const uint8_t root[32]){
     deriveDevKey(root, m_termIdx, m_devKey);
@@ -648,7 +682,7 @@ public:
     if (g_priorityMode == "dp" && m_retryCnt == 0){
       g_dpWincnt[{best, m_prio}] = g_dpWincnt[{best, m_prio}] + 1.0;
     }
-    if (g_collisionOn && !slotOk(best, t, m_prio)){
+    if (g_collisionOn && !slotOk(best, t, m_prio, g_rachUnits)){
       if (m_retryCnt >= g_retryMax){      // 重试超限 → 接入失败
         g_dbg_collision_fail++;
         TermFail("collision_fail");
@@ -660,14 +694,25 @@ public:
       Simulator::Schedule(Seconds(backoff), &LeoApp::AttemptAccess, this);
       return;
     }
-    // ---- ★审计修复★：四步 RACH 前导竞争（机理化，原为常量附加时延）----
-    // 同 (sat, 时隙, 前导) 被多终端选中 → msg3 竞争解决失败 → 退避重来。
-    if (g_rachSteps >= 4){
-      uint32_t slot10 = (uint32_t)(t / 0.01);
-      uint32_t pre = g_runRng() % g_nPreamble;
-      auto pkey = std::make_tuple(best, slot10, pre);
-      auto pit = g_preambleUse.find(pkey);
-      if (pit != g_preambleUse.end() && pit->second != m_termIdx){
+    // ---- ★T3 接入方案分派（3 方案，镜像 sim/protocol.py）★ ----
+    // rel17_4step     : Rel-17 四步（前导竞争）—— 已落地基线
+    // twostep_precomp : 本项目 —— 两步 + TA 预补偿（免竞争）
+    // msgarep_2step   : 论文(Kim et al., WCL 2025) —— 两步 MsgA 冲突，发 kMsgArepM 份副本，
+    //                   任一份避开冲突即成功（副本分集降有效失败率）
+    bool needContend = (g_rachScheme == "rel17_4step") || (g_rachScheme == "msgarep_2step");
+    int reps = (g_rachScheme == "msgarep_2step") ? (int)kMsgArepM : 1;
+    if (needContend){
+      bool got = false;
+      for (int rep = 0; rep < reps; ++rep){
+        uint32_t slot10 = (uint32_t)(t / 0.01);
+        uint32_t pre = g_runRng() % g_nPreamble;
+        auto pkey = std::make_tuple(best, slot10, pre);
+        auto pit = g_preambleUse.find(pkey);
+        if (pit != g_preambleUse.end() && pit->second != m_termIdx) continue; // 该副本冲突
+        g_preambleUse[pkey] = m_termIdx;
+        got = true;   // 任一副本命中即成功（不 break：M 份都发送，占用 M 前导，体现资源代价）
+      }
+      if (!got){
         if (m_retryCnt >= (uint32_t)g_retryMax){
           TermFail("contention_fail");
           return;
@@ -678,9 +723,9 @@ public:
         Simulator::Schedule(Seconds(backoff), &LeoApp::AttemptAccess, this);
         return;
       }
-      g_preambleUse[pkey] = m_termIdx;
     }
     m_servingSat = best;
+    g_satLoad[best]++;   // Graph-KM 负载记账（★镜像 Python sat_load★）
     double rg = rangeKm(g_termPos[m_nodeId], satPosAt(best, t));
     double delay = rg / C_KM_S;
     g_dbg_req++;
@@ -705,39 +750,12 @@ public:
     g_channel->Tx(m_nodeId, best, p, delay);
   }
 
-  void Tick(){
-    if (!m_active || !m_accessed) return;
-    double t = Simulator::Now().GetSeconds();
-    auto vis = visibleAt(m_nodeId, t);
-    // 当前服务星剩余可见时间
-    double servingRemain = -1;
-    for (auto& v : vis){
-      if (std::get<0>(v) == m_servingSat){ servingRemain = std::get<1>(v); m_servingLos = std::get<2>(v); }
-    }
-    if (servingRemain < 0){
-      // 服务星已不可见：立即选最佳重连（不应发生，预测应已切换）；缺口如实记录
-      if (!vis.empty()){
-        uint32_t best=0; double be=-1e9, bestLos=-1;
-        for (auto& v : vis){
-          uint32_t s=std::get<0>(v);
-          double el=elevationDeg(g_termPos[m_nodeId], satPosAt(s,t));
-          if (el>be){ be=el; best=s; bestLos=std::get<2>(v); }
-        }
-        // 应急重连：候选此刻可见 → 可连时刻即 t；决策时刻亦为 t（缺口 = max(0, t − 旧LOS)）
-        DoHandover(best, t, t, m_servingLos, bestLos, t);
-      }
-      Simulator::Schedule(Seconds(g_tickS), &LeoApp::Tick, this);
-      return;
-    }
-    if (servingRemain <= g_hoLeadS){
-      // 预测式切换（T5/T6）—— 与 Python 轨 sim/protocol.py 完全同一判决规则：
-      //   1) 候选池 = 在服务星 LOS 时刻仍可见的其他星（重叠，先建后断）；
-      //      LOS 时无其他可见候选 → 退化为「最早升起星」兜底（缺口如实记录）；
-      //   2) 选优指标 = 未来驻留时长（los − t_ho）最大者（稳定优先，抑制乒乓）；
-      PredictAndHandover(t);
-    }
-    Simulator::Schedule(Seconds(g_tickS), &LeoApp::Tick, this);
-  }
+  // ★T2 同步（2026-09-16）★：原 Tick 以 g_tickS(默认 1s) 轮询触发切换，使反应式策略的 t_ho
+  // 被量化到 ±1s，而 elevation 基线中断约 380ms（来自真实物理时延），轮询量化会淹没该结论。
+  // 现改为「确定性逐段决策 + 在精确 t_ho 调度切换事件」（与 Python 轨 run_protocol 逐段即时算
+  // 法一致），消除轮询量化，保证双轨同口径。Tick 已废弃移除。
+
+
 
   // 与 Python 轨 sim/protocol.py 逐条同规则的候选选择与切换（失配/乒乓/中断口径一致）
   // ★审计修复★：联合打分 score = w_el·el_norm + w_dwell·dwell_norm（与 Python 轨一致）。
@@ -755,69 +773,214 @@ public:
     return g_wEl * elNorm + g_wDwell * dw;
   }
 
-  void PredictAndHandover(double t){
-    double tLosTrue = m_servingLos;
-    // ★审计修复★：星历预测误差（TLE 老化 → LOS 估计偏差，零均值高斯）。
-    // 原实现用完美未来窗口，预测永不失败 → 中断恒为 0（结构性恒等，非算法成果）。
-    double tLos = tLosTrue;
-    if (g_ephemErrS > 0){
-      std::normal_distribution<double> nd(0.0, g_ephemErrS);
-      tLos += nd(g_runRng);
+  // ===== 切换决策辅助（★镜像 sim/protocol.py T2 四策略★）=====
+  // 时刻 t 可见且非 servingSat 的窗口
+  std::vector<Window> visibleOthers(double t, uint32_t servingSat){
+    std::vector<Window> out;
+    auto it = g_termWins.find(m_nodeId);
+    if (it == g_termWins.end()) return out;
+    for (const auto& w : it->second){
+      if (w.satId == servingSat) continue;
+      if (w.aos <= t && t <= w.los) out.push_back(w);
     }
-    // 决策时刻（同 Python: t_ho = max(预测LOS − ho_lead, 连接建立时刻)）
-    double tHo = std::max(tLos - g_hoLeadS, m_accessFinT);
-    // ★P0-1 修复★：切换冷却——距上次切换 < 30s 不切，抑制仿真末端
-    // （两窗口几乎同时结束 + 星历误差抖动）造成的乒乓震荡（与 Python 轨同规则）。
-    if (!m_hoHist.empty() && (tHo - m_hoHist.back().second) < 30.0){
-      return;
+    return out;
+  }
+  // 最早升起(aos > t)的窗口（★镜像 Python next_visible_after★）
+  Window nextVisibleAfter(double t){
+    Window best{0, 1e18, 1e18};
+    auto it = g_termWins.find(m_nodeId);
+    if (it == g_termWins.end()) return best;
+    for (const auto& w : it->second)
+      if (w.aos > t && w.aos < best.aos) best = w;
+    return best;
+  }
+  // 卫星 satId 在时刻 at 所属窗口的 LOS（用于取候选 LOS）
+  double winLos(uint32_t satId, double at){
+    auto it = g_termWins.find(m_nodeId);
+    if (it != g_termWins.end())
+      for (const auto& w : it->second)
+        if (w.satId == satId && w.aos <= at && at <= w.los) return w.los;
+    return -1.0;
+  }
+  // 窗口集合中联合打分最优者
+  uint32_t bestByScoreLocal(const std::vector<Window>& wins, double at){
+    uint32_t best = 0; double bs = -1e9;
+    for (const auto& w : wins){
+      double s = hoScore(w.satId, at);
+      if (s > bs){ bs = s; best = w.satId; }
     }
-    // 候选 A：预测 LOS 时刻仍可见的非服务星（重叠覆盖，先建后断）
-    uint32_t cand = 0; double candScore = -1e9, candLos = -1;
-    auto visLos = visibleAt(m_nodeId, tLos);
-    auto itWin = g_termWins.find(m_nodeId);
-    for (auto& v : visLos){
-      uint32_t s = std::get<0>(v);
-      if (s == m_servingSat) continue;
-      double los = std::get<2>(v);
-      // 防御（同 Python）：候选 LOS 必须严格晚于服务星预测 LOS
-      if (los <= tLos + 1e-9) continue;
-      double aosOf = -1;
-      if (itWin != g_termWins.end()){
-        for (const auto& w : itWin->second){
-          if (w.satId == s && w.aos <= tLos && tLos <= w.los){ aosOf = w.aos; break; }
+    return best;
+  }
+  // 仰角归一质量（★镜像 Python _el_deg 归一★）
+  double elNormLocal(uint32_t satId, double at){
+    double el = elevationDeg(g_termPos[m_nodeId], satPosAt(satId, at));
+    return std::max(0.0, std::min(1.0, (el - g_maskDeg) / (90.0 - g_maskDeg)));
+  }
+  // DQN 长期价值：剩余可见时间占比 × 仰角质量（★镜像 Python _vlong★）
+  double vlong(uint32_t satId, double at){
+    double los = winLos(satId, at);
+    if (los <= 0 || at > los) return 0.0;
+    return ((los - at) / 600.0) * elNormLocal(satId, at);
+  }
+  // Graph-KM：负载感知权重最优者（★镜像 Python graph 分支★）
+  uint32_t bestByLoadScore(const std::vector<Window>& wins, double at){
+    uint32_t best = 0; double bs = -1e9;
+    double nt = (double)std::max(1u, g_nTerms);
+    for (const auto& w : wins){
+      double pen = kGraphLoadPen * std::min(1.0, g_satLoad[w.satId] / nt);
+      double s = hoScore(w.satId, at) - pen;
+      if (s > bs){ bs = s; best = w.satId; }
+    }
+    return best;
+  }
+  // T8 业务感知提前量冗余(s)（★镜像 config.T8_SERVICE_HO_LEAD_EXTRA_S★）
+  static double t8LeadSec(const std::string& svc){
+    if (svc == "voice") return 12.0;
+    if (svc == "image") return 4.0;
+    return 0.0;
+  }
+
+  // ★T2 同步（2026-09-16）★：统一切换决策（★逐行镜像 sim/protocol.py ho_policy 分支★）。
+  // 给定当前服务段 (servingSat, servingLos, connectT)，返回 (needHo, tHo, cand, candLos, candConnect, forced)。
+  struct HoDecision { bool needHo=false; double tHo=0; uint32_t cand=0; double candLos=0; double candConnect=0; bool forced=false; };
+
+  HoDecision DecideHandover(double connectT, uint32_t servingSat, double servingLos){
+    HoDecision d;
+    double losTrue = servingLos;
+    double losPred = losTrue;
+    if (g_ephemErrS > 0){ std::normal_distribution<double> nd(0.0, g_ephemErrS); losPred += nd(g_runRng); }
+    double lastHo = m_hoHist.empty() ? -1e18 : m_hoHist.back().second;
+    double reactMargin = (g_hoHyst > 0) ? g_hoHyst : 0.05;
+    double reactCond   = (g_choCond > 0) ? g_choCond : 0.05;
+    double reactTtt    = (g_choTtt > 0) ? g_choTtt : 5.0;
+
+    if (g_hoPolicy == "predictive" || g_hoPolicy == "predictive_nopremig"){
+      // 预测式（本职）：在预测 LOS 末端提前 ho_lead 决策（先建后断）；T8 业务感知给语音/图像额外提前量
+      // ★消融臂 predictive_nopremig★：提前量/候选选择与 predictive **完全相同**，仅由
+      //   ScheduleNextHandover/DoHandover 的 doPreMigrate 判定关闭星间预迁移（切换重 RACH）
+      //   → 用于分离「预测提前量收益」与「预迁移零中断收益」。
+      double hoLeadEff = g_hoLeadS;
+      if (g_t8PriorityOn) hoLeadEff += t8LeadSec(m_service);
+      d.tHo = std::max(losPred - hoLeadEff, connectT);
+      d.forced = false;
+      auto ov = visibleOthers(d.tHo, servingSat);
+      if (!ov.empty()){
+        uint32_t bc = bestByScoreLocal(ov, d.tHo);
+        double curScore = hoScore(servingSat, d.tHo);
+        // 迟滞：新目标得分未超出当前服务星足够余量 → 不切换（抑制抖动/乒乓）
+        if (!(g_hoHyst > 0 && hoScore(bc, d.tHo) < curScore + g_hoHyst)){
+          d.cand = bc; d.candLos = winLos(bc, d.tHo); d.candConnect = d.tHo; d.needHo = true;
+        }
+      } else {
+        Window nxt = nextVisibleAfter(d.tHo);
+        if (nxt.satId != 0){ d.cand = nxt.satId; d.candLos = nxt.los; d.candConnect = nxt.aos; d.needHo = true; }
+      }
+    } else if (g_hoPolicy == "rel17"){
+      // ★T2 业内②★ Rel-17 NTN 已部署标准：反应式、无预测提前量，LOS 末端才切（四步 RACH）
+      d.tHo = losTrue; d.forced = true;
+      losPred = d.tHo;
+      auto ov = visibleOthers(losPred, servingSat);
+      if (!ov.empty()){
+        uint32_t bc = bestByScoreLocal(ov, d.tHo);
+        d.cand = bc; d.candLos = winLos(bc, d.tHo); d.candConnect = d.tHo; d.needHo = true;
+      }
+      if (!d.needHo){
+        Window nxt = nextVisibleAfter(losPred);
+        if (nxt.satId != 0){ d.cand = nxt.satId; d.candLos = nxt.los; d.candConnect = nxt.aos; d.needHo = true; }
+      }
+    } else if (g_hoPolicy == "dqn"){
+      // ★T2 论文①★ DQN 收敛策略（镜像 Python）：取「rem≥kTSafe 且 vlong 增益≥kLambdaHo」的**最晚**候选事件
+      double bestTe = -1.0;
+      auto itW = g_termWins.find(m_nodeId);
+      if (itW != g_termWins.end()){
+        std::vector<double> evs;
+        for (const auto& w : itW->second){
+          if (w.satId == servingSat) continue;
+          if (connectT < w.aos && w.aos < losTrue) evs.push_back(w.aos);
+        }
+        std::sort(evs.begin(), evs.end());
+        for (double te : evs){
+          if (losTrue - te < kTSafe) continue;
+          auto ov = visibleOthers(te, servingSat);
+          if (ov.empty()) continue;
+          uint32_t bc = bestByScoreLocal(ov, te);
+          if (vlong(bc, te) - vlong(servingSat, te) >= kLambdaHo) bestTe = te;
         }
       }
-      if (aosOf < 0 || aosOf > tHo + 1e-9) continue;
-      double sc = hoScore(s, tHo);
-      if (sc > candScore){ candScore = sc; candLos = los; cand = s; }  // 联合打分最优
-    }
-    if (cand != 0){
-      // ★迟滞★：新目标得分未超出当前服务星足够余量 → 不切换（抑制抖动/乒乓）
-      if (g_hoHyst > 0){
-        double curScore = hoScore(m_servingSat, tHo);
-        if (candScore < curScore + g_hoHyst) return;
+      if (bestTe >= 0){ d.tHo = bestTe; d.forced = false; }
+      else { d.tHo = losTrue; d.forced = true; }
+      losPred = d.tHo;
+      auto ov = visibleOthers(losPred, servingSat);
+      if (!ov.empty()){
+        uint32_t bc = bestByScoreLocal(ov, d.tHo);
+        if (d.forced || hoScore(bc, d.tHo) > hoScore(servingSat, d.tHo) + reactCond){
+          d.cand = bc; d.candLos = winLos(bc, d.tHo); d.candConnect = d.tHo; d.needHo = true;
+        }
       }
-      // ★审计修复（2026-09-02 第 2 轮，镜像 Python 轨）★：重叠候选在决策时刻 tHo 已可见，
-      // 预测式「先建后断」应即刻建链（可连时刻 = tHo），而非等到预测 LOS。
-      // 原 candConnect=tLos 使 hoLead 提前量被完全旁路（中断≈max(0, LOS 预测高估误差)）。
-      RotateCredential();  // ★P2★ 假名轮换 + 哈希链推进（每次切换）
-      if (g_preMigrate) g_satCtx[cand][m_termIdx] = g_satCtx[m_servingSat][m_termIdx];  // D3 预迁移（键=term_id）
-      DoHandover(cand, t, tHo, tLosTrue, candLos, tHo);
-      return;
-    }
-    // 候选 B：无重叠候选 → 最早升起星兜底（覆盖盲区，中断如实记录）
-    uint32_t nid = 0; double naos = 1e18, nlos = -1;
-    auto it = g_termWins.find(m_nodeId);
-    if (it != g_termWins.end()){
-      for (const auto& w : it->second){
-        if (w.satId == m_servingSat) continue;
-        if (w.aos > tLos && w.aos < naos){ naos = w.aos; nid = w.satId; nlos = w.los; }
+      if (!d.needHo){
+        Window nxt = nextVisibleAfter(losPred);
+        if (nxt.satId != 0){ d.cand = nxt.satId; d.candLos = nxt.los; d.candConnect = nxt.aos; d.needHo = true; }
+      }
+    } else {
+      // ★T2 业内①/论文②★ cho=3GPP NTN 时间型条件切换；graph=二部图负载感知匹配（IEEE OJCOMS 2025）。
+      // 二者均按「预测 LOS 末端 − 提前量」先建后断执行；区别在候选权重（graph 负载感知 + 滞回边）。均无预迁移。
+      double lead = std::max((g_choTtt > 0) ? g_choTtt : 12.0, REACT_MIN_GAP_S);
+      double tExec = losTrue - lead;
+      double firstAos = 1e18;
+      auto itW = g_termWins.find(m_nodeId);
+      if (itW != g_termWins.end()){
+        for (const auto& w : itW->second){
+          if (w.satId == servingSat) continue;
+          if (connectT < w.aos && w.aos < losTrue && w.aos < firstAos) firstAos = w.aos;
+        }
+      }
+      if (firstAos < 1e18 && tExec < firstAos) tExec = firstAos;  // 候选尚未可见，顺延到其 AOS
+      if (tExec <= connectT) tExec = connectT + REACT_MIN_GAP_S;
+      auto ovChk = visibleOthers(tExec, servingSat);
+      bool hasCand = false;
+      for (auto& w : ovChk){ if (w.aos <= tExec + 1e-9){ hasCand = true; break; } }
+      if (hasCand){ d.tHo = tExec; d.forced = false; }
+      else { d.tHo = losTrue; d.forced = true; }
+      losPred = d.tHo;
+      auto ov = visibleOthers(losPred, servingSat);
+      if (!ov.empty()){
+        double nt = (double)std::max(1u, g_nTerms);
+        if (g_hoPolicy == "graph"){
+          uint32_t bc = bestByLoadScore(ov, d.tHo);
+          double bw = hoScore(bc, d.tHo) - kGraphLoadPen * std::min(1.0, g_satLoad[bc] / nt);
+          double cw = hoScore(servingSat, d.tHo) - kGraphLoadPen * std::min(1.0, g_satLoad[servingSat] / nt);
+          if (d.forced || bw > cw + kGraphHyst){
+            d.cand = bc; d.candLos = winLos(bc, d.tHo); d.candConnect = d.tHo; d.needHo = true;
+          }
+        } else {
+          uint32_t bc = bestByScoreLocal(ov, d.tHo);
+          if (d.forced || hoScore(bc, d.tHo) > hoScore(servingSat, d.tHo) + reactCond){
+            d.cand = bc; d.candLos = winLos(bc, d.tHo); d.candConnect = d.tHo; d.needHo = true;
+          }
+        }
+      }
+      if (!d.needHo){
+        Window nxt = nextVisibleAfter(losPred);
+        if (nxt.satId != 0){ d.cand = nxt.satId; d.candLos = nxt.los; d.candConnect = nxt.aos; d.needHo = true; }
       }
     }
-    if (nid == 0) return;   // 全仿真无后续可见星，保持当前连接至结束
-    RotateCredential();  // ★P2★ 假名轮换 + 哈希链推进（每次切换）
-    if (g_preMigrate) g_satCtx[nid][m_termIdx] = g_satCtx[m_servingSat][m_termIdx];  // D3 预迁移（键=term_id）
-    DoHandover(nid, t, naos, tLosTrue, nlos, tLos);
+    // 候选 LOS 不晚于服务 LOS → 不可行，放弃切换（★镜像 Python cand['los_s'] <= los_pred 守卫★）
+    if (d.needHo && d.candLos <= losPred + 1e-9) d.needHo = false;
+    return d;
+  }
+
+  // 计算当前服务段的下一次切换并调度（确定性、非轮询，消除 g_tickS 量化）
+  void ScheduleNextHandover(){
+    if (!m_active || !m_accessed) return;
+    HoDecision d = DecideHandover(m_segConnectT, m_servingSat, m_servingLos);
+    if (!d.needHo) return;
+    double now = Simulator::Now().GetSeconds();
+    double delay = d.tHo - now;
+    if (delay < 0) delay = 0;
+    // 星间认证上下文预迁移仅本职预测式拥有（★镜像 Python do_premigrate = pre_migrate && policy=="predictive"★）
+    bool doPreMigrate = (g_preMigrate != 0) && (g_hoPolicy == "predictive");
+    Simulator::Schedule(Seconds(delay), &LeoApp::DoHandover, this,
+                        d.cand, d.tHo, d.candConnect, m_servingLos, d.candLos, d.tHo, doPreMigrate);
   }
 
   // ★P2 假名轮换 + 哈希链推进★：每次切换递增 epoch、重派生信令假名、哈希链单向推进
@@ -851,13 +1014,15 @@ private:
   uint32_t m_servingSat;
   double m_servingLos;
   double m_accessFinT;    // 本段连接建立完成时刻（GRANT 收到时）——用于决策时刻下界
+  double m_segConnectT;   // 当前服务段连接建立时刻（=accessFinT 或上一跳 start_connect），决策下界
+  std::string m_service = "sms"; // 业务类型 voice/image/sms（T8 业务感知切换用）
   uint16_t m_seq;
   // ★审计修复★：乒乓重定义所需历史 [(satId, 切换时刻)]
   std::vector<std::pair<uint32_t,double>> m_hoHist;
 
   // ★签名变更（审计修复）★：新增 losTrue（真实 LOS，区别于预测 LOS），用于中断计算。
   void DoHandover(uint32_t cand, double t, double candConnect, double losTrue,
-                  double candLos, double tHo){
+                  double candLos, double tHo, bool doPreMigrate){
     double rg = rangeKm(g_termPos[m_nodeId], satPosAt(cand, t));
     double delay = rg / C_KM_S;
     // 预测失配（契约 2.1，与 Python 轨一致）：决策选中的候选 vs 执行时刻（服务星 LOS）
@@ -891,7 +1056,9 @@ private:
     // ★审计修复（2026-09-02 第 2 轮，镜像 Python 轨）★：重连确认须在目标可达（candConnect）
     // 之后才能收发，故新链可用 = candConnect + execS（原从 tHo 起算取 max）。
     double execS;
-    bool hasCtx = g_satCtx.count(cand) && g_satCtx[cand].count(m_termIdx) > 0;  // D3（键=term_id）
+    // ★T2 同步★：星间认证上下文预迁移仅本职预测式执行（★镜像 Python do_premigrate = pre_migrate && policy=="predictive"★）
+    if (doPreMigrate) g_satCtx[cand][m_termIdx] = g_satCtx[m_servingSat][m_termIdx];  // D3 预迁移（键=term_id）
+    bool hasCtx = doPreMigrate && g_satCtx.count(cand) && g_satCtx[cand].count(m_termIdx) > 0;  // D3（键=term_id）
     // ★P1 修复（镜像 Python protocol.py）★：重连时延 if/else 二选一，不再重复计数基础段。
     // 原实现 execS 先初始化基础段、无预迁移时再累加基础段+rerach → 重复计数。
     if (hasCtx){
@@ -932,7 +1099,10 @@ private:
             << std::setprecision(2) << elCost << ",0,none,"
             << std::setprecision(2) << (g_linkModelOn ? ebnoDb(rg) : 0.0) << "\n";
     m_servingSat = cand;
+    g_satLoad[cand]++;   // Graph-KM 负载记账（★镜像 Python sat_load★；累积语义，见文件头调查结论）
     m_servingLos = candLos;
+    m_segConnectT = candConnect;   // 下一段连接建立时刻（决策下界）
+    ScheduleNextHandover();        // 链入下一段切换决策（确定性，非轮询）
   }
 
   void HandleTerminalRx(const LeoHeader& h, uint32_t srcId){
@@ -956,8 +1126,15 @@ private:
               << (m_forged?1:0) << "," << authRes << ","
               << std::setprecision(2) << (g_linkModelOn ? ebnoDb(rg) : 0.0) << "\n";
       m_accessed = true;
+      m_servingSat = h.satId;
+      // 记录当前服务段 LOS（用于切换决策下界，★替代原 Tick 轮询★）
+      auto itw = g_termWins.find(m_nodeId);
+      if (itw != g_termWins.end())
+        for (const auto& w : itw->second)
+          if (w.satId == h.satId && w.aos <= t && t <= w.los){ m_servingLos = w.los; break; }
       m_accessFinT = t;
-      Simulator::Schedule(Seconds(g_tickS), &LeoApp::Tick, this);
+      m_segConnectT = t;
+      ScheduleNextHandover();   // ★T2 同步★：确定性逐段切换调度（替代原 Tick 轮询）
     } else if (h.msgType == 4){ // HO_CONFIRM
       // 中断已在 DoHandover 决策时记录；此处仅确认（无需重复写）
     } else if (h.msgType == 5){ // ACCESS_DENY：校验失败（伪造拦截或误码虚警）
@@ -1031,7 +1208,7 @@ private:
     g_channel->Register(m_nodeId, this);
     if (m_isTerminal){
       Simulator::Schedule(Seconds(m_burstT), &LeoApp::AttemptAccess, this);
-      Simulator::Schedule(Seconds(m_burstT), &LeoApp::Tick, this);
+      // ★T2 同步★：切换由接入成功后 ScheduleNextHandover 确定性链入，不再依赖 Tick 轮询
     }
   }
   virtual void StopApplication(){ m_active = false; }
@@ -1088,9 +1265,54 @@ static bool readEphemeris(const std::string& path, const std::map<std::string,ui
   return true;
 }
 
+// ★方案A（2026-09-16）★ 读 Python 写出的格点可见窗（grid_windows.csv）：
+//   cell_i,cell_j,sat_name,aos_s,los_s
+// 两轨因此共用同一套窗 —— 可见性判定逐字一致。
+static bool readGridWindows(const std::string& path,
+                            const std::map<std::string,uint32_t>& satNameToId){
+  std::ifstream f(path);
+  if (!f) return false;                       // 缺文件 → 回退每终端自算（旧行为）
+  std::string line; std::getline(f, line);    // header
+  std::string field;
+  while (std::getline(f, line)){
+    if (line.empty()) continue;
+    std::stringstream ss(line);
+    std::vector<std::string> c;
+    while (std::getline(ss, field, ',')) c.push_back(field);
+    strip_cr(c);
+    if (c.size() < 5) continue;
+    try {
+      int ci = std::stoi(c[0]), cj = std::stoi(c[1]);
+      auto it = satNameToId.find(c[2]);
+      if (it == satNameToId.end()) continue;
+      double aos = std::stod(c[3]), los = std::stod(c[4]);
+      g_cellWins[{ci, cj}].push_back({it->second, aos, los});
+    } catch (...) { continue; }
+  }
+  return !g_cellWins.empty();
+}
+
 static bool precomputeWindows(){
+  // ★方案A（2026-09-16）★ 优先用 Python 写出的格点窗：终端取其所吸附格点的窗，
+  // 与 Python 轨 run_protocol(cell_windows=...) 严格同源。文件缺失时回退下方自算（旧行为）。
+  if (!g_cellWins.empty()){
+    uint32_t nShared = 0, nFallback = 0;
+    for (auto& kv : g_termPos){
+      uint32_t termId = kv.first;
+      auto itc = g_termCell.find(termId);
+      if (itc != g_termCell.end()){
+        auto itw = g_cellWins.find(itc->second);
+        if (itw != g_cellWins.end()){ g_termWins[termId] = itw->second; ++nShared; continue; }
+      }
+      ++nFallback;
+    }
+    std::cout << "  ★方案A★ 网格窗已加载：格点=" << g_cellWins.size()
+              << " 终端命中=" << nShared << " 回退自算=" << nFallback << std::endl;
+    if (nFallback == 0) return true;   // 全部命中，无需自算
+  }
   for (auto& kv : g_termPos){
     uint32_t termId = kv.first; const Ecef& t = kv.second;
+    if (g_termWins.count(termId)) continue;   // 已由网格窗命中
     std::vector<Window> wins;
     for (auto& ev : g_eph){
       uint32_t satId = ev.first; const auto& v = ev.second;
@@ -1123,6 +1345,7 @@ int main(int argc, char* argv[]){
   double authExtraMs=0, forgedRatio=0;
   double retryIntervalMs=500;
   uint32_t rachSteps=2, rachCapacity=64, retryMax=20, nTerms=80;
+  std::string rachScheme="twostep_precomp";  // ★T3★ rel17_4step | twostep_precomp | msgarep_2step
   int32_t collisionOn=0;
   int32_t priorityOn=1;   // ★生存优先★ default true（同 Python scenario.priority_on 默认）
   // ---- ★审计修复 2026-09-02：新增机理参数（与 sim/config.py 同参）----
@@ -1132,6 +1355,10 @@ int main(int argc, char* argv[]){
   int32_t linkModelOn=1;
   uint32_t preMigrate=1;   // D3：认证上下文预迁移开关（默认开启）
   uint64_t rngSeed=20260901;   // ★原固定 12345，现可配置（多种子/置信区间实验）★
+  // ---- ★T2 切换基线对比（★镜像 sim/protocol.py ho_policy★）----
+  std::string hoPolicy="predictive";   // predictive | elevation | hysteresis | cho
+  double elevTh=10.0, choCond=0.0, choTtt=0.0;
+  int32_t t8PriorityOn=1;       // T8 业务感知切换开关（默认开，镜像 Python t8_priority_on）
 
   CommandLine cmd;
   cmd.AddValue("indir", "输入目录", indir);
@@ -1151,6 +1378,7 @@ int main(int argc, char* argv[]){
   cmd.AddValue("compromisedShare", "伪造中持有效密钥比例(漏检率)", compromisedShare);
   cmd.AddValue("authExtraMs", "认证附加时延(ms)", authExtraMs);
   cmd.AddValue("rachSteps", "RACH 模式(2=两步 4=四步)", rachSteps);
+  cmd.AddValue("rachScheme", "T3 接入方案(rel17_4step/twostep_precomp/msgarep_2step)", rachScheme);
   cmd.AddValue("collisionOn", "碰撞/拥塞模型开关", collisionOn);
   cmd.AddValue("priorityOn", "生存优先分级调度开关", priorityOn);
   cmd.AddValue("rachCapacity", "每10ms时隙受理上限", rachCapacity);
@@ -1176,12 +1404,25 @@ int main(int argc, char* argv[]){
   cmd.AddValue("linkModelOn", "链路模型开关", linkModelOn);
   cmd.AddValue("preMigrate", "认证上下文预迁移开关(1/0)", preMigrate);
   cmd.AddValue("rngSeed", "随机种子", rngSeed);
+  // ★T2 切换基线对比★
+  cmd.AddValue("hoPolicy", "切换策略(predictive/elevation/hysteresis/cho)", hoPolicy);
+  cmd.AddValue("elevTh", "仰角阈值硬切换触发门限(度)", elevTh);
+  cmd.AddValue("choCond", "CHO 条件阈值(score单位)", choCond);
+  cmd.AddValue("choTtt", "CHO 时间窗TTT(s)", choTtt);
+  cmd.AddValue("t8PriorityOn", "T8 业务感知切换开关(1/0)", t8PriorityOn);
   cmd.Parse(argc, argv);
 
   g_maskDeg = maskDeg; g_carrierHz = carrierHz; g_hoLeadS = hoLead;
   g_tickS = tickS; g_accessProcMs = accessProcMs; g_simDur = simDur;
   g_authExtraMs = authExtraMs;
   g_rachSteps = rachSteps; g_forgedRatio = forgedRatio;
+  g_rachScheme = rachScheme;   // ★T3★ 按方案解算 rachSteps（★镜像 Python★）
+  if (g_rachScheme == "rel17_4step") g_rachSteps = 4;
+  else if (g_rachScheme == "twostep_precomp" || g_rachScheme == "msgarep_2step") g_rachSteps = 2;
+  // ★T3★ 时隙容量消耗（镜像 sim/protocol.py RACH_SLOT_UNITS）
+  if (g_rachScheme == "rel17_4step")          g_rachUnits = 2;            // Msg1+Msg3
+  else if (g_rachScheme == "msgarep_2step")   g_rachUnits = (uint32_t)kMsgArepM;  // M 份副本
+  else                                        g_rachUnits = 1;
   g_compromisedShare = compromisedShare;
   g_collisionOn = (collisionOn != 0); g_rachCapacity = rachCapacity;
   g_priorityOn = (priorityOn != 0);
@@ -1196,6 +1437,10 @@ int main(int argc, char* argv[]){
   g_eirpDbm = eirpDbm; g_gtDbiK = gtDbiK; g_bitRateBps = bitRateBps;
   g_linkModelOn = (linkModelOn != 0); g_rngSeed = rngSeed;
   g_preMigrate = (preMigrate != 0);
+  g_hoPolicy = hoPolicy;
+  g_elevTh = elevTh; g_choCond = choCond; g_choTtt = choTtt;
+  g_nTerms = nTerms;  // Graph-KM 负载归一用
+  g_t8PriorityOn = (t8PriorityOn != 0);
   g_runRng.seed((uint32_t)rngSeed);
 
   std::cout << "[LeoAccess] ns-3 离散事件接入/切换仿真启动" << std::endl;
@@ -1210,11 +1455,19 @@ int main(int argc, char* argv[]){
   std::cout << "  星历误差σ=" << ephemErrS << "s 选星权重 wEl=" << wEl
             << " 迟滞=" << hoHyst << " 种子=" << rngSeed
             << " 生存优先=" << (priorityOn ? "开" : "关") << " 模式=" << g_priorityMode << std::endl;
+  std::cout << "  切换策略 hoPolicy=" << g_hoPolicy
+            << (g_hoPolicy=="cho" ? (" cond="+std::to_string(g_choCond)+" TTT="+std::to_string(g_choTtt)+"s")
+                : g_hoPolicy=="graph" ? (" 负载惩罚="+std::to_string(kGraphLoadPen)+" 滞回="+std::to_string(kGraphHyst))
+                : g_hoPolicy=="dqn" ? (" lambdaHo="+std::to_string(kLambdaHo)+" TSafe="+std::to_string(kTSafe)+"s")
+                : g_hoPolicy=="predictive_nopremig" ? (" 消融臂(关闭星间预迁移) hoLead="+std::to_string(g_hoLeadS)+"s")
+                : "")
+            << " T8业务感知=" << (g_t8PriorityOn ? "开" : "关") << std::endl;
 
   // 读终端
   std::map<uint32_t, Ecef> termPosTmp;
   std::map<uint32_t, std::string> termTag;
   std::map<uint32_t, double> termBurst;
+  std::map<uint32_t, std::pair<int,int>> termCellTmp;   // ★方案A★ CSV term_id -> 吸附格点
   {
     std::ifstream f(indir + "/terminals.csv");
     std::string line; std::getline(f, line);
@@ -1237,6 +1490,11 @@ int main(int argc, char* argv[]){
       double z=(nn*(1-e2)+h)*std::sin(la);
       termPosTmp[(uint32_t)id] = {x,y,z};
       termTag[(uint32_t)id] = tag;
+      // ★方案A★ 可选列 cell_i,cell_j（终端吸附的 5×5 格点索引，见 sim/ns3_io.gen_terminals）
+      // 注意：此处按 CSV 的 term_id 暂存，稍后建节点时再重映射到 ns-3 nodeId（与 g_termPos 同键）。
+      if (c.size() >= 7){
+        try { termCellTmp[(uint32_t)id] = {std::stoi(c[5]), std::stoi(c[6])}; } catch (...) {}
+      }
     }
   }
 
@@ -1283,6 +1541,9 @@ int main(int argc, char* argv[]){
     mm->SetPosition(Vector(p.x, p.y, p.z));
     n->AggregateObject(mm);
     g_termPos[tid] = p;   // 几何查询按 ns-3 节点 id 索引（与 visibleAt 一致）
+    // ★方案A★ 吸附格点同样改按 nodeId 索引（与 g_termPos 一致；此前误用 CSV id）
+    auto itc = termCellTmp.find(i);
+    if (itc != termCellTmp.end()) g_termCell[tid] = itc->second;
   }
 
   // 读星历到 g_eph（按 nodeId）
@@ -1301,6 +1562,11 @@ int main(int argc, char* argv[]){
   }
   std::cout << "  星历采样步数=" << nSteps << std::endl;
 
+  // ★方案A★ 读 Python 写出的格点可见窗（两轨同源）；缺文件则回退每终端自算
+  if (readGridWindows(indir + "/grid_windows.csv", satNameToId))
+    std::cout << "  网格窗文件已载入（方案A：双轨同源可见性）" << std::endl;
+  else
+    std::cout << "  [警告] 未读到 grid_windows.csv，回退每终端自算窗（双轨可能不一致）" << std::endl;
   precomputeWindows();
 
   // 安装应用
@@ -1325,6 +1591,10 @@ int main(int argc, char* argv[]){
     bool isCompromised = isForged && (u(rng) < g_compromisedShare);
     app->SetForged(isForged, isCompromised);
     app->InitCredential(rootKey);   // 所有终端初始化派生密钥与假名
+    // ★T8 业务感知切换（★镜像 Python service_type 分布 voice0.2/image0.5/sms0.3★）
+    double usvc = u(rng);
+    std::string svc = (usvc < 0.20) ? "voice" : (usvc < 0.70) ? "image" : "sms";
+    app->SetService(svc);
     n->AddApplication(app);
     app->SetStartTime(Seconds(0));
     app->SetStopTime(Seconds(simDur));

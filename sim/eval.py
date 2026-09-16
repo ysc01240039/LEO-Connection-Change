@@ -16,7 +16,8 @@
 - 接入时延：端到端 = (GRANT 完成时刻 − 首次发起时刻)，含退避/等待与握手全程，仅计成功事件。
 """
 import statistics as st
-from .config import PRIO_WEIGHTS, SERVICE_INTERRUPT_TOL_MS, PRIO_UTIL_W
+from .config import (PRIO_WEIGHTS, SERVICE_INTERRUPT_TOL_MS, PRIO_UTIL_W,
+                     PINGPONG_WINDOW_S, PINGPONG_MIN_GAP_S)
 
 
 def _f(x):
@@ -67,6 +68,29 @@ def compute_metrics(trace: list, summary: dict | None = None) -> dict:
         m["切换中断最大_ms"] = round(max(inter), 2)
         m["切换中断非零比例"] = round(sum(1 for x in inter if x > 0) / nh, 4)
         m["乒乓切换率"] = round(sum(1 for e in ho if _i(e.get("pingpong", 0)) == 1) / nh, 4)
+        # ---- ★乒乓构成分解（2026-09-16）★ ----
+        # 乒乓率的两个判据被合并成单一 flag，掩盖了「真·切回抖动」（T6 要抑制的对象）与
+        # 「由提前切换引起的快速连切」（predictive 为保零中断而接力切换的代价）的区别。
+        # 实测：predictive 乒乓 4.13% 高于全部基线，但其相邻切换间隔中位 289.7s 正常、
+        # 仅 4.22% <10s；即高乒乓来自快速连切分量。此处按终端重算并分别给出两个分量，
+        # 使报告如实呈现（仅用 trace 既有字段，无需改契约；两轨同一实现）。
+        by_term = {}
+        for e in ho:
+            by_term.setdefault(e.get("terminal"), []).append(e)
+        n_rapid = n_back = 0
+        for evs in by_term.values():
+            evs.sort(key=lambda e: _f(e["t_s"]))
+            hist = []                       # [(target_sat, t_s)]
+            for i, e in enumerate(evs):
+                t = _f(e["t_s"])
+                tgt = e.get("target_sat")
+                if i > 0 and (t - _f(evs[i - 1]["t_s"])) < PINGPONG_MIN_GAP_S:
+                    n_rapid += 1
+                if any(s == tgt and (t - ts) <= PINGPONG_WINDOW_S for s, ts in hist):
+                    n_back += 1
+                hist.append((tgt, t))
+        m["乒乓_快速连切率"] = round(n_rapid / nh, 4)
+        m["乒乓_切回率"] = round(n_back / nh, 4)
         m["预测失配率"] = round(sum(1 for e in ho if _i(e.get("predict_mismatch", 0)) == 1) / nh, 4)
         m["仰角代价均值_deg"] = round(sum(elc) / nh, 2)
         m["仰角代价最大_deg"] = round(max(elc), 2)

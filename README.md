@@ -4,6 +4,13 @@
 
 ---
 
+> 📌 **新增工作入口：[`exp/README.md`](exp/README.md)**
+> 含 **T2 切换 5 策略对比矩阵**（predictive / cho / rel17 / dqn / graph）、**T3 接入 3 方案对比**
+> （twostep_precomp / rel17_4step / msgarep_2step）、对既有文件的**改动清单**、**已弃置项**说明、
+> 新人上手步骤与一键提交脚本（`exp/do_commit.sh`）。
+
+---
+
 ## 目录
 
 1. [项目应对场景](#一项目应对场景)
