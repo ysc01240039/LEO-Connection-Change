@@ -58,6 +58,9 @@ def access_events(trace_path):
                     "result": row["result"],
                     "value_ms": float(row["value_ms"]),
                     "forged": int(row.get("forged", "0") or 0),
+                    # ★修复（2026-09-22）★：需读 auth_result 才能按主口径区分
+                    # 「密码层拦截」与「拥塞未认证」，见 summarize()。
+                    "auth_result": (row.get("auth_result") or "").strip(),
                 })
             except (ValueError, KeyError):
                 continue
@@ -65,15 +68,32 @@ def access_events(trace_path):
 
 
 def summarize(events):
-    """§三 接入实验指标：平均/P95时延、成功率、RACH吞吐、伪造拦截率、认证开销。"""
+    """§三 接入实验指标：平均/P95时延、成功率、RACH吞吐、伪造拦截率、认证开销。
+
+    ★修复（2026-09-22）：拦截率口径对齐主口径（sim/eval.py P0-1）★
+    原实现 `伪造终端拦截率 = 伪造终端中 result != success / 伪造总数`，把**拥塞失败**
+    （凭据根本没进入认证环节就被容量挡住）也算作「被拦截」，与 sim/eval.py 的 P0-1
+    口径不一致：主口径明确以「密码层拦截 / 进入认证环节的伪造终端」为分母，拥塞失败
+    单列（`伪造终端拥塞未认证数`）。在风暴等高拥塞场景下两者会显著背离（混淆
+    「容量拦截」与「密码拦截」两种不同机制），与合规文档「口径一致」的承诺矛盾。
+    现改为与主口径严格一致：分母 = blocked + missed，拥塞失败单列。
+    P95 取法亦对齐主口径（int(0.95*n) 向下取整，原为 ceil-1，小样本下可能差一位）。
+    """
     succ = [e for e in events if e["result"] == "success"]
-    fails = [e for e in events if e["result"] != "success"]
     lat = [e["value_ms"] for e in succ if e["value_ms"] > 0]
     total = len(events)
     forged = [e for e in events if e["forged"] == 1]
-    forged_blocked = [e for e in forged if e["result"] != "success"]
+    # 密码层拦截：MAC 校验失败 / 重放被拒（与 eval.py blocked 定义一致）
+    blocked = sum(1 for e in forged if e["auth_result"] in ("bad_mac", "replay"))
+    # 漏检：密钥泄露型伪造终端通过校验入网
+    missed = sum(1 for e in forged if e["auth_result"] == "ok_missed")
+    # 拥塞/竞争导致未进入认证环节（既非密码层拦截，亦非漏检）→ 单列，不进拦截率分母
+    n_cont = sum(1 for e in forged
+                 if e["auth_result"] in ("collision_fail", "contention_fail", "none", ""))
+    auth_seen = blocked + missed
     if lat:
-        p95 = sorted(lat)[max(0, min(len(lat) - 1, int(math.ceil(0.95 * len(lat))) - 1))]
+        # 与 sim/eval.py 的 _p95 严格一致：索引 int(0.95*n)（向下取整，上限 len-1）
+        p95 = sorted(lat)[min(len(lat) - 1, int(0.95 * len(lat)))]
     else:
         p95 = None
     ts = [e["t_s"] for e in events]
@@ -85,7 +105,10 @@ def summarize(events):
         "接入时延P95_ms": round(p95, 3) if p95 is not None else None,
         "RACH吞吐_成功每秒": round(len(succ) / span, 4) if span > 0 else None,
         "伪造终端数": len(forged),
-        "伪造终端拦截率": round(len(forged_blocked) / len(forged), 4) if forged else None,
+        # ★口径对齐主口径（eval.py P0-1）：分母=进入认证环节的伪造终端（blocked+missed）
+        "伪造终端拦截率": round(blocked / auth_seen, 4) if auth_seen else None,
+        "伪造终端漏检率": round(missed / auth_seen, 4) if auth_seen else None,
+        "伪造终端拥塞未认证数": n_cont,
         "认证开销_ms": None,  # 逐事件认证开销未落盘，标 null（README 说明）
     }
 

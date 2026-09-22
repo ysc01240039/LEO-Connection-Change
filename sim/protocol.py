@@ -302,10 +302,12 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
 
     _load = {}        # (sat, 10ms时隙) -> 已受理数（priority_on=False 单池；priority_on=True 作可回收保护位共享计数器）
     _preamble = {}    # (sat, 时隙, 前导) -> 首个占用终端（四步竞争）
+    _forged_compromised = {}  # term_id -> bool：伪造终端是否「持有效密钥」的固有属性（按终端固定判定，见下）
 
     # ---- 科学版 dp 调度状态（priority_mode=="dp" 时使用）----
     # 模型：每 (sat, 10ms 时隙) 总占用；guard-channel 准入（见 sim/prio_opt.py）。
-    _dp_occ = {}       # (sat, slot) -> 总占用数（dp 模式）
+    _dp_occ = {}       # sat -> {slot: 占用数}（dp 模式；按星分桶，跨窗口整桶回收，内存有界）
+    _dp_occ_cur = {}   # sat -> 该桶当前的时隙游标（用于跨窗口淘汰判定）
     _dp_ewma = {}      # (sat, tier) -> 各档到达率 λ 的 EWMA（每窗口更新）
     _dp_wincnt = {}    # (sat, tier) -> 当前窗口到达计数
     _dp_win = {}       # sat -> 当前窗口索引
@@ -365,7 +367,28 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                     _dp_wincnt[(sat, tier)] = 0
             # --- guard-channel 准入（窗口/到达计数在事件循环按「首次尝试」更新）---
             gh, gm = _dp_guards.get(sat, (_dp_def_gh, _dp_def_gm))
-            occ = _dp_occ.get((sat, slot), 0)
+            # ★修复（2026-09-22）：guard 边界保护★
+            # gh/gm 由 optimal_guards 返回，取值域为 [0, c]。当 gh==c（或 gh+gm==c）时，
+            # 中/低危准入上界退化为 0，occ+slot_units<=0 恒假 → 该档被【无条件永久饿死】，
+            # 与 optimal_guards 的折中目标叠加会放大病态。此处硬约束：
+            # 高危独占至多保留 c-1 个单位的 guard，确保中/低危至少保有 1 个单位的准入空间
+            # （对应「生存优先 ≠ 其余全弃」；容量不足以服务任何终端时属物理过载，非策略所致）。
+            gh = min(gh, max(0, rach_capacity - 1))
+            gm = min(gm, max(0, rach_capacity - gh - 1))
+            # ★修复（2026-09-22）：_dp_occ 内存泄漏★
+            # 原实现只写不删，(sat, slot) 键随「卫星数 × 时隙数」无限累积：1h 仿真步长 10ms
+            # 即 36 万时隙 × 最多 651 颗星 → 潜在百万级条目常驻内存。占用记录的语义是
+            # 「当前时隙的瞬时状态」，过期时隙永不再被访问，故按时隙滑窗淘汰。
+            # 实现为「每星独立小字典 + 当前时隙游标」：跨窗口时整桶重置，淘汰 O(1)，
+            # 且桶内仅含本窗口时隙（≤ PRIO_ADAPT_WIN_S/0.01 条），内存有界。
+            bucket = _dp_occ.get(sat)
+            if bucket is None:
+                bucket = {}
+                _dp_occ[sat] = bucket
+            elif _dp_occ_cur.get(sat) is None or slot - _dp_occ_cur[sat] >= _dp_slot_per_win:
+                bucket.clear()          # 窗口推进：过期时隙占用不再有意义
+            _dp_occ_cur[sat] = slot
+            occ = bucket.get(slot, 0)
             if prio == 0:
                 ok = occ + slot_units <= rach_capacity
             elif prio == 1:
@@ -373,7 +396,7 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             else:
                 ok = occ + slot_units <= rach_capacity - gh - gm
             if ok:
-                _dp_occ[(sat, slot)] = occ + slot_units
+                _dp_occ[sat][slot] = occ + slot_units
                 # 回收计数：med/low 落入高危预留区 [c-gh, c) → 闲置预留被复用
                 if prio != 0 and occ >= rach_capacity - gh:
                     _dp_reclaim[sat] = _dp_reclaim.get(sat, 0) + 1
@@ -528,7 +551,16 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
 
         # ---- T4：真实星上凭证校验（伪造终端亦占用时隙：星上须先接收再拒绝）----
         if is_forged:
-            compromised = rng.random() < P["compromised_share"]
+            # ★修复（2026-09-22）：compromised 改为按终端固定判定★
+            # 原实现在每次进入认证环节时 rng.random() 重抽 compromised，导致同一伪造终端
+            # 在多次重试之间「时而持密钥、时而不持」——而「密钥是否泄露」是攻击者的**固有
+            # 属性**，一次实验中应恒定，重抽在物理上不成立，且使漏检率偏离理论值
+            # 1-compromised_share（实测 0.26 vs 期望 0.15，因多次重试终端被重复掷骰）。
+            # 现按 term_id 固定判定一次并缓存，语义与 auth.py 的建模说明严格一致。
+            compromised = _forged_compromised.get(k)
+            if compromised is None:
+                compromised = rng.random() < P["compromised_share"]
+                _forged_compromised[k] = compromised
             if compromised:
                 # 持有效密钥：能生成合法 MAC 且 counter 递增 → 密码层无法检出
                 dk = _auth.derive_dev_key(root_key, k)

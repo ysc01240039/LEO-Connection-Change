@@ -75,17 +75,35 @@ def optimal_guards(c: int, Ah: float, Am: float, Al: float,
     参数取整后缓存（lru_cache），同一负载形状只解一次 → 仿真中近乎 O(1)。
     wm/wl：中/低危在目标函数中的权重（高危由 ε 约束保护，不进目标）。
     eps：高危阻塞率 QoS 上界（CAC 目标），默认 10%。
+
+    ★修复（2026-09-22）：不可行区退化★
+    原实现在无可行解时按 key=(1, round(Bh,8), round(obj,8)) 排序，即「只按高危阻塞
+    最小」。在窄带重载（如风暴场景 c=4、A=(4,4,4)）下必然无可行解，该规则会选出
+    g_h=c 的病态解——**以冻结全部中低危（B_m=B_l=1.0）换取 B_h 从 0.3168 到 0.3107
+    的 0.6% 边际改善**，且 Bh 的 8 位小数精度使 obj 在第三位几乎失效，等价于完全
+    放弃中低危。这与「生存优先≠其余全弃」的设计目标相悖。
+    现改为不可行区使用**相对代价归一化排序**：
+        cost = B_h + (wm·B_m + wl·B_l) / (wm + wl)
+    即在高危阻塞与中低危加权阻塞之间做加权折中（两者同量纲、均在 [0,1]），
+    既不放弃高危保护，也不允许以「全灭其余」换取微小改善。
+    可行解区逻辑保持不变（B_h ≤ eps 硬约束优先，再最小化中低危加权阻塞）。
     """
     Ah, Am, Al = round(float(Ah), 4), round(float(Am), 4), round(float(Al), 4)
     eps = float(eps)
+    wsum = (wm + wl) or 1.0
     best = None  # (sort_key, (gh,gm), (Bh,Bm,Bl))
     for gh in range(0, c + 1):
         for gm in range(0, c - gh + 1):
             bh, bm, bl, _ = blocking(c, Ah, Am, Al, gh, gm)
             feasible = bh <= eps
             obj = wm * bm + wl * bl
-            # 可行解优先，按目标最小；不可行则按高危阻塞最小（保高危）
-            key = (0, round(obj, 8), round(bh, 8)) if feasible else (1, round(bh, 8), round(obj, 8))
+            if feasible:
+                # 可行：硬约束已满足，最小化中低危加权阻塞（再以 Bh 作次级判据）
+                key = (0, round(obj, 8), round(bh, 8))
+            else:
+                # 不可行：高危与中低危加权阻塞的折中（同量纲），避免「全灭中低危」病态解
+                cost = bh + obj / wsum
+                key = (1, round(cost, 8), round(bh, 8), round(obj, 8))
             if best is None or key < best[0]:
                 best = (key, (gh, gm), (bh, bm, bl))
     return best[1], best[2]

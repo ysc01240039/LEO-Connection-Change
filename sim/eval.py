@@ -130,8 +130,11 @@ def compute_metrics(trace: list, summary: dict | None = None) -> dict:
         m["fake_terminal_total"] = nf
         m["block_rate"] = m["伪造终端拦截率"]
     if legit:
+        # ★清理（2026-09-22）★：原条件含 "false_reject"，但 auth.OnboardAuth.verify()
+        # 的返回值域仅为 {ok, bad_mac, replay}，protocol.py 从不产生 "false_reject"，
+        # 属永不命中的冗余判定（易误导读者以为存在该状态）。现按真实值域收紧。
         fr = sum(1 for e in legit if e.get("result") == "fail"
-                 and e.get("auth_result") in ("bad_mac", "replay", "false_reject"))
+                 and e.get("auth_result") in ("bad_mac", "replay"))
         m["合法终端虚警率"] = round(fr / len(legit), 4)
 
     if summary:
