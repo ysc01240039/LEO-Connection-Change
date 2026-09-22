@@ -87,15 +87,15 @@ from .config import (SIM_START_UTC, CARRIER_FREQ_HZ, SPEED_OF_LIGHT, MASK_ANGLE_
 C_KM_S = SPEED_OF_LIGHT / 1000.0  # 299792.458 km/s
 MAX_DWELL_S = 600.0               # 驻留归一化基准（LEO 25° 掩角典型过境时长）
 REACT_MIN_GAP_S = 2.0              # 反应式切换最小间隔（物理切换执行时间下限）
-# ★T2 基线算法参数（2026-09-16）★
-# DQN（简化表格 Q-learning，同源 Badini TAES 2024）：在候选事件序列上做带时序自举的决策。
-_LAMBDA_HO = 0.25                  # 奖励中「切换成本」权重（switch 奖励 = 候选收益 − λ）
-_DQN_ALPHA = 0.3                   # Q-learning 学习率
-_DQN_GAMMA = 0.90                  # 折扣因子（时序自举：未来价值折算）
-_DQN_EPS = 0.05                    # ε-greedy 探索率（确定性种子，双轨可镜像）
-_P_FORCED = 1.0                    # LOS 末端被迫切换的惩罚（避免「等太久」）
-_T_SAFE = 5.0                      # 先建后断安全提前量(s)：切换须在服务星剩余 ≥ 此值时执行（保证重叠）
-_P_INT = 2.0                       # 中断风险代价权重（软约束，使智能体不「贴着 LOS 末端」切）
+# ★T2 基线算法参数（2026-09-16；2026-09-22 清理）★
+# DQN（同源 Badini TAES 2024）：取该论文 DQN **收敛后**的确定性等价策略——
+# 「满足安全提前量、且增益 ≥ 切换成本」的候选事件中取最晚者切换。
+# 与 ns-3 轨（leo_access.cc DecideHandover 的 dqn 分支）严格同参、同判据。
+_LAMBDA_HO = 0.25                  # 切换成本权重 λ：增益须 ≥ λ 才值得切换（两轨一致）
+_T_SAFE = 5.0                      # 先建后断安全提前量(s)：须在服务星剩余 ≥ 此值时切换（保证重叠）
+# （2026-09-22 移除以下 4 个从未被引用的死常量：_DQN_ALPHA / _DQN_GAMMA / _DQN_EPS /
+#   _P_FORCED / _P_INT —— 它们是早期「在线 Q-learning（自举 + ε-greedy + 被迫惩罚）」设计的
+#   残余；dqn 已定稿为「收敛策略的确定性等价」（见 dqn 分支），这些在线学习常量不再有意义。）
 # Graph-KM（IEEE OJCOMS 2025「二部图 + 滞回边」）：
 # 注：本模型无卫星容量约束时，最大权二部图匹配(KM)在数学上退化为每终端加权 argmax（权重可分离），
 #     故「加权 argmax + 滞回边」即 KM 在本模型下的解；负载项为额外均衡启发（本模型容量未建模）。
@@ -197,9 +197,11 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
     # 预迁移 = 将 (term_id, counter) 推送到候选星，无预迁移则新星须重新 RACH。
     sat_ctx = {}
     term_epoch = {}   # P2 假名轮换：每终端假名轮换版本（首联=0，每次切换 +1）
+    term_pseudo = {}  # P2 假名轮换：每终端**当前生效**的信令假名（轮换后由 make_pseudo(epoch) 重派生）
     chain_state = {}  # P2 哈希链续认证：每终端当前链头（首联下发种子，切换逐跳推进）
     # ★T2 基线状态（2026-09-16）★
-    qtab = {}         # DQN(简化 Q-learning) 共享 Q 表：(rv_bin, nc_bin, action) -> Q 值
+    # （2026-09-22 移除 qtab：dqn 统一为「收敛策略的确定性等价」，不再维护在线 Q 表，
+    #   与 ns-3 轨 leo_access.cc 的 dqn 分支严格一致。）
     sat_load = {}     # Graph-KM 负载记账：sat -> 已承载终端数（供负载感知匹配）
 
     t0 = _dt.datetime.fromisoformat(SIM_START_UTC.replace("Z", "+00:00"))
@@ -617,7 +619,10 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
 
         # ---- 合法终端：链路误码可能导致 MAC 被破坏 → 星上误拒（虚警）----
         dk = _auth.derive_dev_key(root_key, k)
-        ps = _auth.make_pseudo(root_key, k)
+        # ★P2 完整化（2026-09-22）★：凭证使用**当前生效**假名——首联为 epoch0 派生；
+        # 若该终端曾切换，则用轮换后的新假名（term_pseudo），使「每次切换轮换」在凭证层真正生效
+        # （原实现恒用 make_pseudo(root,k)=epoch0，轮换不被使用）。
+        ps = term_pseudo.get(k) or _auth.make_pseudo(root_key, k)
         mac = _auth.sign(dk, ps, term_attempts[k] + 1)
         if P["link_model_on"] and mac_fail_prob(slant, AUTH_MAC_BYTES * 8, BIT_RATE_BPS,
                                                 el_deg=best_el) > rng.random():
@@ -670,7 +675,10 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
         cur = next((w for w in segs if w["sat"] == connect_sat
                     and w["aos_s"] <= connect_t <= w["los_s"]), None)
         ho_hist = []          # [(sat, t_switch)] 用于乒乓判定
-        last_ho_t = {}        # {term_id: 上次切换时刻} 跨段持久，供 CHO 的 TTT 计时
+        # ★清理（2026-09-22）★：原 `last_ho_t`（{term_id: 上次切换时刻}）**只写不读**，
+        # 其注释「供 CHO 的 TTT 计时」会误导读者以为 CHO 的 TTT 计时已实现——实际 cho 按
+        # 「LOS 末端前 cho_ttt 执行 + 候选评分超 cho_cond」建模，**未**做 TTT 持续计时
+        # 的独立状态机（忠实度说明见 docs/技术决策确认.md §3.1）。故删除该死变量。
         early_waste = 0.0
         while cur is not None:
             los_true = cur["los_s"]
@@ -735,12 +743,16 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                 t_ho, forced = los_true, True
                 los_pred = t_ho
             elif policy == "dqn":
-                # ★T2 论文①★ DQN（简化表格 Q-learning，同源 Badini et al., IEEE TAES 60(6), 2024）：
-                #   在候选 AOS 事件序列上决策 {wait, switch}；状态=(剩余驻留分箱, 候选数分箱)。
-                #   奖励：switch = 候选收益(gain) − λ·HO成本；wait = 0；LOS 末端被迫切换 = −P_FORCED。
-                #   ★带时序自举的 Q-learning（TD(0)，反向备份）★：wait 的后继价值 = 下一事件 max_a Q，
-                #   使智能体真正权衡「现在切」与「再等等」→ 同时最小化切换次数与中断（复现论文降 HO 方向）。
-                #   Q 表跨终端共享、在线更新；确定性（固定种子）→ 双轨可镜像。无星间预迁移。
+                # ★T2 论文①★ DQN（同源 Badini et al., IEEE TAES 60(6), 2024）：
+                #   在候选 AOS 事件序列上决策 {wait, switch}；奖励 = 候选收益(gain) − λ·切换成本。
+                #   ★实现口径（与 ns-3 轨严格一致）★：取论文 DQN **收敛后**的确定性等价策略——
+                #   在「满足先建后断安全提前量(rem ≥ _T_SAFE) 且长期价值增益 ≥ λ」的候选事件中，
+                #   取**最晚**一个切换：既吃尽服务星剩余价值（降切换次数），又保留足够重叠（降中断）。
+                #   ★2026-09-22 双轨对齐★：原 Python 侧另维护一张在线 Q 表(qtab)并以其作额外门控，
+                #   而 ns-3 轨（leo_access.cc DecideHandover 的 dqn 分支）从未实现该表 →
+                #   两轨 dqn 语义不一致（实测切换事件数 Py 14307 vs ns-3 14822）。
+                #   决策文档 §3.1 已声明 dqn 定位为「DQN 收敛策略的确定性等价（非在线学习）」，
+                #   故移除在线门控，两轨统一为该确定性判据。无星间预迁移。
                 def _vlong(w, at):
                     # 长期价值：剩余可见时间占比 × 链路质量(仰角归一)。已含未来 → 无需自举。
                     rem = max(0.0, w["los_s"] - at) / MAX_DWELL_S
@@ -765,14 +777,10 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
                         continue
                     bc = max(ov, key=lambda w: _score(w, te))
                     gain = _vlong(bc, te) - _vlong(cur, te)
-                    rv = rem_srv / max(1e-9, los_true - connect_t)
-                    rvb, ncb = min(3, int(rv * 4)), min(2, len(ov))
-                    ok = 1 if gain >= _LAMBDA_HO else 0
-                    # Q 表记录该状态学到的最优动作（1=切），在线按奖励更新
-                    key = (rvb, ncb, 1)
-                    qtab[key] = qtab.get(key, 0.0) + _DQN_ALPHA * ((gain - _LAMBDA_HO) - qtab.get(key, 0.0))
-                    if ok and qtab.get(key, 0.0) > qtab.get((rvb, ncb, 0), 0.0):
-                        best_te = te
+                    # ★与 ns-3 轨严格一致（2026-09-22）★：仅按「增益 ≥ 切换成本」判定，不引入
+                    # 在线 Q 表门控（ns-3 无此表；且文档声明为收敛策略的确定性等价）。
+                    if gain >= _LAMBDA_HO:
+                        best_te = te          # 取最晚的可行事件
                 if best_te is not None:
                     t_ho, forced = best_te, False
                 los_pred = t_ho
@@ -831,13 +839,25 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             # 故撤回，保持「累积计数 / 终端总数」的弱归一；graph 定位为**近似实现**（见文档）。
             sat_load[cand["sat"]] = sat_load.get(cand["sat"], 0) + 1
 
+            # ★顺序修正（2026-09-22）★：可行性守卫（候选 LOS 不晚于预测 LOS → 放弃本次切换）
+            # 必须置于「凭证轮换 / 预迁移上下文」写入**之前**。原实现把该守卫放在其后，
+            # 致「决策切换后因候选不可行而放弃」时仍递增 epoch → 假名轮换次数 > 实际切换事件数
+            # （T2 crossval 实测：cho 14850≠14299、rel17 14755≠13616、dqn 15446≠14307、graph 14530≠13979）。
+            # ns-3 轨的 RotateCredential() 在 DoHandover（确认执行切换）内调用，其轮换次数
+            # 严格 = 切换事件数；现统一为「仅在确认执行切换时轮换」，与 ns-3 轨严格对齐。
+            if cand["los_s"] <= los_pred + 1e-9:
+                break
+
             # ---- D3 认证上下文星间预迁移（先建后断）----
             # 服务星在决策时刻 t_ho 将本终端认证上下文（pseudo + 当前计数器）经星间链路
             # 提前打包迁移至预测目标星；切换时新星凭预置上下文一次比对即确认（RACH-less）。
             # 若 pre_migrate 关闭，或预测失配导致实际目标星 ≠ 迁移目标星，则新星无上下文 → 回退重新 RACH。
             # ★P2 假名轮换★：每次切换 epoch 递增，信令假名随之轮换（前向不可关联）
             term_epoch[k] = term_epoch.get(k, 0) + 1
-            pk = _auth.make_pseudo(root_key, k, term_epoch[k])
+            # ★P2 完整化（2026-09-22）★：重派生并**保存生效假名**供后续凭证使用。
+            # 原实现把派生结果赋给局部变量 pk 后从未使用（死赋值）→ 「每次切换轮换」仅停留在
+            # epoch 计数，未在凭证层生效；现保存到 term_pseudo，接入路径取用（见下方 make_pseudo 处）。
+            term_pseudo[k] = _auth.make_pseudo(root_key, k, term_epoch[k])
             # ★T2★：星间预迁移仅本职预测式拥有；反应式基线无此机制（对比公平性）
             do_premigrate = P["pre_migrate"] and policy == "predictive"
             if do_premigrate:
@@ -847,9 +867,6 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             # ★P2 哈希链续认证★：切换时终端出示哈希链下一跳，星上推进链头（单向防重放）
             if k in chain_state:
                 chain_state[k] = _auth.chain_next(chain_state[k])
-
-            if cand["los_s"] <= los_pred + 1e-9:
-                break
 
             # 中断 = max(0, 新链可用 − 旧链真实丢失)
             # ★单位：t_ho/start_connect 为秒，ho_d_ms/access_proc_ms/auth_extra_ms 为毫秒★
@@ -912,7 +929,6 @@ def run_protocol(access_windows, scenario, sats=(), ts=None, rng_seed: int = 202
             if ho_hist and (t_ho - ho_hist[-1][1]) < PINGPONG_MIN_GAP_S:
                 pingpong = 1
             ho_hist.append((cand["sat"], t_ho))
-            last_ho_t[k] = t_ho
 
             trace.append(_mk("HANDOVER", k, tag, t_ho, cur["sat"], cand["sat"],
                              round(interrupt * 1000.0, 3), ho_dop, ho_slant, ho_result,

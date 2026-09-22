@@ -79,13 +79,26 @@ def inject_meta(obj, platform, commit, commit_full, run_id, scenario):
 # 1) 回填现存结果 JSON 的 platform/commit
 # ---------------------------------------------------------------------------
 def curated_platform_scenario(name):
-    """results/*.json 的 platform 与 scenario 映射。"""
+    """results/*.json 的 platform 与 scenario 映射（★2026-09-22 逐文件核实后更正★）。
+
+    原实现把所有 curated results 默认标为 "python+ns3"（"双轨聚合"），与事实不符。
+    逐文件核实结论：
+      · 含 summary["n_pseudo_rotation"] / ["dp_avg_gh"] / "话音业务平均中断_ms"
+        等**仅 Python 轨 summary 才有**的字段 → 实为 **Python 单轨**：
+        {henan,wenchuan,wenchuan_storm2,wenchuan_storm4}_metrics.json、summary_20260903.json。
+      · 聚合**两轨** run 的产物（台账读全部 manifest；分组指标读两轨 access_trace.csv；
+        认证三档读两轨含伪造终端 run）→ 确为 **python+ns3**：
+        experiment_ledger.json、subgroup_metrics.json、auth_tier_comparison.json。
+    """
+    DUAL = {"experiment_ledger.json", "subgroup_metrics.json", "auth_tier_comparison.json"}
+    stem = name[:-5] if name.endswith(".json") else name
+    if name in DUAL:
+        return "python+ns3", stem              # 真·双轨聚合
     if name == "summary_20260903.json":
-        return "python+ns3", "all(汇总)"
+        return "python", "all(汇总)"
     if name == "敏感性分析_20260903.json":
         return "python", "sensitivity"
-    stem = name[:-5] if name.endswith(".json") else name
-    return "python+ns3", stem  # 双轨聚合
+    return "python", stem                       # 其余 curated 指标 = Python 单轨（更正前误标 python+ns3）
 
 
 def backfill_results(head_full, head_short):
@@ -157,7 +170,11 @@ def scenario_from_dir(dname):
 def build_ledger(head_full, head_short):
     env = {
         "python": sys.version.split()[0],
-        "platform": sys.platform,
+        # ★更正（2026-09-22）★：platform 采用《存档规范》§二口径（python / ns3 /
+        # python+ns3），而非本机 OS 名（原 sys.platform 会写出 "win32"，与规范语义冲突）。
+        # 本台账聚合双轨全部 run → "python+ns3"；生成机 OS 另记 os 字段。
+        "platform": "python+ns3",
+        "os": sys.platform,
         "git_head_full": head_full,
         "git_head_short": head_short,
         "generated_at": now_iso(),

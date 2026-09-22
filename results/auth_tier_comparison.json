@@ -1,23 +1,23 @@
 {
   "spec": "天权 · 认证三档对比实验指标口径",
   "spec_file": "C:/Users/ASUS/Desktop/天权_认证三档对比指标口径.docx",
-  "generated_at": "2026-09-16T12:55:20.795026Z",
+  "generated_at": "2026-09-22T07:12:13.276443Z",
   "schemes": {
     "hmac_dual_root": {
       "available": true,
       "implemented": true,
       "source": "sim/auth.py（HMAC-SHA256 双根，真实校验）",
       "block_rate": {
-        "mean": 0.8322,
-        "stdev": 0.0728,
-        "n": 307
+        "mean": 0.837,
+        "stdev": 0.071,
+        "n": 376
       },
       "auth_latency_ms": {
-        "mean": 0.1048,
-        "stdev": 0.0147,
-        "n": 307
+        "mean": 0.1059,
+        "stdev": 0.0157,
+        "n": 376
       },
-      "note": "本方案实测；block_rate=密码层拦截/进入认证环节的伪造终端，auth_latency_ms=认证引入额外时延(HMAC校验×星上降频)。聚合自 307 个含伪造终端的 HMAC run（跨多场景，非单条件5种子重复）。"
+      "note": "本方案实测；block_rate=密码层拦截/进入认证环节的伪造终端，auth_latency_ms=认证引入额外时延(HMAC校验×星上降频)。聚合自 376 个含伪造终端的 HMAC run（跨多场景，非单条件5种子重复）。"
     },
     "no_auth": {
       "available": true,

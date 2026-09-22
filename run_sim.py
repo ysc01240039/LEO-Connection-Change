@@ -83,7 +83,12 @@ def parse_args(argv):
         elif a == "--ho-policy" and nxt:
             args["ho_policy"] = nxt; i += 2
         elif a == "--elev-th" and nxt:
+            # ★弃用提示（2026-09-22）★：elevation 基线已删除（见 exp/README.md §三），
+            # 两轨均无 elev_th / g_elevTh 的任何读取分支——本参数**无实际效果**。
+            # 保留仅为向后兼容旧命令，但不再静默：显式提示，避免「以为设了生效」的误判。
             args["elev_th"] = float(nxt); i += 2
+            print(f"[WARN] --elev-th={nxt} 已弃用：elevation 基线已删除，该参数无任何效果；"
+                  f"切换策略请用 --ho-policy cho / rel17 / dqn / graph。", file=sys.stderr)
         elif a == "--cho-cond" and nxt:
             args["cho_cond"] = float(nxt); i += 2
         elif a == "--cho-ttt" and nxt:
@@ -92,6 +97,14 @@ def parse_args(argv):
             args["rach_scheme"] = nxt; i += 2
         else:
             pos.append(a); i += 1
+    # ★基线取值域白名单（2026-09-22）★：与 runtime 一致——非法/拼错的策略必须 fail-fast，
+    # 避免静默落入 else 分支（Python 侧 cho/rel17/dqn 共用的默认候选选择）产出错误结果。
+    HO_POLICIES = ("predictive", "predictive_nopremig", "cho", "rel17", "dqn", "graph")
+    RACH_SCHEMES = ("rel17_4step", "twostep_precomp", "msgarep_2step")
+    if args["ho_policy"] not in HO_POLICIES:
+        raise SystemExit(f"[FATAL] 未知 --ho-policy={args['ho_policy']!r}；可选: {HO_POLICIES}")
+    if args["rach_scheme"] is not None and args["rach_scheme"] not in RACH_SCHEMES:
+        raise SystemExit(f"[FATAL] 未知 --rach-scheme={args['rach_scheme']!r}；可选: {RACH_SCHEMES}")
     return pos, args
 
 

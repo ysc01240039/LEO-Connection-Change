@@ -67,7 +67,12 @@ def parse_args(argv):
         elif a == "--ho-policy" and nxt:
             args["ho_policy"] = nxt; i += 2
         elif a == "--elev-th" and nxt:
+            # ★弃用提示（2026-09-22）★：elevation 基线已删除（见 exp/README.md §三），
+            # C++ 侧 g_elevTh 仅保留声明、无任何读取分支——本参数**无实际效果**。
+            # 保留仅为向后兼容旧命令，但不再静默：显式提示，避免「以为设了生效」的误判。
             args["elev_th"] = float(nxt); i += 2
+            print(f"[WARN] --elev-th={nxt} 已弃用：elevation 基线已删除，该参数无任何效果；"
+                  f"切换策略请用 --ho-policy cho / rel17 / dqn / graph。", file=sys.stderr)
         elif a == "--cho-cond" and nxt:
             args["cho_cond"] = float(nxt); i += 2
         elif a == "--cho-ttt" and nxt:
@@ -82,6 +87,14 @@ def parse_args(argv):
             args["no_viz"] = True; i += 1
         else:
             pos.append(a); i += 1
+    # ★基线取值域白名单（2026-09-22，与 run_sim.py 对称）★：非法/拼错的策略在此即 fail-fast，
+    # 而非等到 WSL 启动、C++ 编译/运行后才报（ns-3 侧 main 亦有同样校验，构成双保险）。
+    HO_POLICIES = ("predictive", "predictive_nopremig", "cho", "rel17", "dqn", "graph")
+    RACH_SCHEMES = ("rel17_4step", "twostep_precomp", "msgarep_2step")
+    if args["ho_policy"] not in HO_POLICIES:
+        raise SystemExit(f"[FATAL] 未知 --ho-policy={args['ho_policy']!r}；可选: {HO_POLICIES}")
+    if args["rach_scheme"] is not None and args["rach_scheme"] not in RACH_SCHEMES:
+        raise SystemExit(f"[FATAL] 未知 --rach-scheme={args['rach_scheme']!r}；可选: {RACH_SCHEMES}")
     return pos, args
 
 
@@ -242,6 +255,26 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
     (rundir / "metrics.json").write_text(
         json.dumps(_m, ensure_ascii=False, indent=2), encoding="utf-8")
     (rundir / "access_trace.csv").write_bytes((ns3_io.NS3_OUT / "access_trace.csv").read_bytes())
+    # ★ 存档合规补齐（2026-09-22）★：ns-3 轨原先**不写 manifest.json**（仅 Python 轨写，
+    # 见 run_sim.py），致实验台账按 manifest 聚合时**漏掉全部 ns-3 run**
+    # （实测 250 个 run 有 manifest / 376 个有 metrics → 126 个 ns-3 run 无法被台账收录）。
+    # 现按 Python 轨 manifest 的字段对齐补齐，使双轨 run 均可被台账/溯源脚本统一聚合。
+    _manifest = {
+        "run_tag": _m["run_id"], "scenario_key": scenario_key, "scenario_name": sc["name"],
+        "group": group, "seed": seed, "reps": 1, "platform": "ns3",
+        "created_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "git_commit": _c,
+        "scenario_config": sc,
+        "param_overrides": {"ho_policy": ho_policy, "rach_scheme": rach_scheme,
+                            "ephem_err": ephem_err, "ho_lead": ho_lead, "hyst": hyst,
+                            "compromised": compromised, "prio_mode": pm,
+                            "cho_cond": cho_cond, "cho_ttt": cho_ttt},
+        "link_model_on": True,
+        "provenance": prov,
+        "protocol_summary": summary,
+    }
+    (rundir / "manifest.json").write_text(
+        json.dumps(_manifest, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     print(f"      产物 -> {rundir}")
 
     if no_viz:

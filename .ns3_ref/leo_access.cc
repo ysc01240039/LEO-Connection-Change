@@ -20,6 +20,8 @@
 #include "ns3/mobility-module.h"
 
 #include <cmath>
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <vector>
@@ -87,7 +89,7 @@ static double     g_wEl            = 0.5;    // 选星仰角权重
 static double     g_wDwell         = 0.5;    // 选星驻留权重
 static double     g_hoHyst         = 0.0;    // 切换迟滞（score 单位）
 // ---- ★T2 切换基线对比（★镜像 sim/protocol.py ho_policy★）----
-// predictive=本职预测式（先建后断+星间预迁移）；elevation/hysteresis/cho=三种反应式基线
+// predictive=本职预测式（先建后断+星间预迁移）；cho(3GPP CHO)/rel17(Rel-17 NTN)/dqn(TAES'24)/graph(OJCOMS'25)=四条对比基线，另有消融臂 predictive_nopremig
 // （无预迁移、按各自真实触发语义在 LOS 段内决策），用于公平对照。
 static std::string g_hoPolicy      = "predictive"; // predictive | predictive_nopremig | cho | rel17 | dqn | graph
                                                    // （5 基线对比矩阵 + 1 消融臂；nopremig=同提前量但关闭星间预迁移）
@@ -146,7 +148,11 @@ static double g_prioBeta     = 0.30;  // EWMA 新窗口权重（同 config.PRIO_
 static double g_prioWm       = 1.00, g_prioWl = 1.00; // 目标函数权重(中,低)（同 config.PRIO_WEIGHTS）
 static double g_prioLoadCal  = 0.80;  // 损失模型负载标定：模型偏保守，乘此系数对齐仿真实测（同 config.PRIO_LOAD_CAL）
 static double g_prioAdaptWinS= 1.00;  // 阈值自适应窗口(s)（同 config.PRIO_ADAPT_WIN_S）
-static std::map<std::pair<uint32_t,uint32_t>, uint32_t> g_dpOcc;     // (sat,10ms槽)->总占用
+// ★修复（2026-09-22，镜像 sim/protocol.py 的 _dp_occ 修复）★：原 (sat,10ms槽)->占用
+// 扁平 map 只增不删，1h 仿真 × 651 星 × 36 万槽 → 潜在百万级条目常驻。
+// 改为「按星分桶 + 游标」，跨窗口整桶回收（见 slotOk），淘汰 O(1)、内存有界。
+static std::map<uint32_t, std::map<uint32_t,uint32_t>> g_dpOcc;  // sat -> {10ms槽 -> 总占用}
+static std::map<uint32_t, uint32_t> g_dpOccCur;                 // sat -> 该桶当前时隙游标（淘汰判定）
 static std::map<std::pair<uint32_t,uint32_t>, double>   g_dpEwma;    // (sat,tier)->λ EWMA
 static std::map<std::pair<uint32_t,uint32_t>, double>   g_dpWincnt;  // (sat,tier)->当前窗口到达计数
 static std::map<uint32_t, int64_t> g_dpWin;        // sat -> 当前窗口索引
@@ -269,6 +275,7 @@ static void dpOptimalGuards(uint32_t c, double Ah, double Am, double Al,
                             int& out_gh, int& out_gm,
                             double& out_bh, double& out_bm, double& out_bl){
   out_gh = 0; out_gm = 0; out_bh = 1.0; out_bm = 1.0; out_bl = 1.0;
+  double wsum = (wm + wl > 0.0) ? (wm + wl) : 1.0; // 不可行区折中代价的归一化分母
   int    best_k0 = 2; double best_k1 = 1e9, best_k2 = 1e9;
   std::vector<double> pi;
   for (int gh = 0; gh <= (int)c; ++gh){
@@ -281,8 +288,13 @@ static void dpOptimalGuards(uint32_t c, double Ah, double Am, double Al,
       for (int b = c_l; b <= (int)c; ++b) if (b >= 0) bl += pi[b];
       bool feasible = (bh <= eps);
       double obj = wm * bm + wl * bl;
+      // ★修复（2026-09-22，镜像 sim/prio_opt.py optimal_guards）★：不可行区退化
+      // 原不可行区 key1=bh（只最小化高危阻塞）→ 窄带重载（风暴 c=4,A=(4,4,4)）下会选出
+      // gh=c 的病态解（冻结全部中低危换 B_h 约 0.6% 的边际改善）。改为同量纲相对代价折中：
+      //   cost = B_h + (wm·B_m + wl·B_l) / (wm + wl)
       int    key0 = feasible ? 0 : 1;
-      double key1 = r8(feasible ? obj : bh);
+      double cost = bh + obj / wsum;
+      double key1 = r8(feasible ? obj : cost);
       double key2 = r8(feasible ? bh  : obj);
       bool better = false;
       if (key0 < best_k0) better = true;
@@ -345,13 +357,30 @@ static bool slotOk(uint32_t satId, double t, uint32_t prio, uint32_t units = 1){
     int gh = (int)g_dpDefGh, gm = (int)g_dpDefGm;
     auto git = g_dpGuards.find(satId);
     if (git != g_dpGuards.end()){ gh = git->second.first; gm = git->second.second; }
-    uint32_t occ = g_dpOcc.count({satId, slot10}) ? g_dpOcc[{satId, slot10}] : 0;
+    // ★修复（2026-09-22，镜像 sim/protocol.py run_protocol）★：guard 边界保护
+    // gh==c（或 gh+gm==c）时中/低危准入上界退化为 0 → 该档被无条件永久饿死。
+    // 硬约束 gh<=c-1、gm<=c-gh-1，确保各档至少保有 1 单位准入空间（生存优先 ≠ 其余全弃）。
+    if (gh > (int)g_rachCapacity - 1) gh = (int)g_rachCapacity - 1;
+    if (gh < 0) gh = 0;
+    if (gm > (int)g_rachCapacity - gh - 1) gm = (int)g_rachCapacity - gh - 1;
+    if (gm < 0) gm = 0;
+    // ★修复（2026-09-22，镜像 sim/protocol.py）★：g_dpOcc 内存泄漏
+    // 按星分桶 + 时隙游标：窗口推进（slot10 跨越 g_dpSlotPerWin）时整桶 clear，内存有界。
+    if (g_dpOcc.find(satId) == g_dpOcc.end()) g_dpOcc[satId] = std::map<uint32_t,uint32_t>();
+    std::map<uint32_t,uint32_t>& bucket = g_dpOcc[satId];
+    auto cit = g_dpOccCur.find(satId);
+    if (cit == g_dpOccCur.end() || slot10 < cit->second
+        || (slot10 - cit->second) >= g_dpSlotPerWin){
+      bucket.clear();               // 窗口推进：过期时隙占用不再有意义
+    }
+    g_dpOccCur[satId] = slot10;
+    uint32_t occ = bucket.count(slot10) ? bucket[slot10] : 0;
     bool ok;
     if      (prio == 0) ok = occ + units <= g_rachCapacity;
     else if (prio == 1) ok = occ + units <= g_rachCapacity - (uint32_t)gh;
     else                ok = occ + units <= g_rachCapacity - (uint32_t)gh - (uint32_t)gm;
     if (ok){
-      g_dpOcc[{satId, slot10}] = occ + units;
+      bucket[slot10] = occ + units;
       // 回收计数：med/low 落入高危预留区 [c-gh, c) → 闲置预留被复用
       if (prio != 0 && occ >= g_rachCapacity - (uint32_t)gh)
         g_dpReclaim[satId] = g_dpReclaim.count(satId) ? g_dpReclaim[satId] + 1 : 1;
@@ -849,10 +878,13 @@ public:
     double losTrue = servingLos;
     double losPred = losTrue;
     if (g_ephemErrS > 0){ std::normal_distribution<double> nd(0.0, g_ephemErrS); losPred += nd(g_runRng); }
-    double lastHo = m_hoHist.empty() ? -1e18 : m_hoHist.back().second;
-    double reactMargin = (g_hoHyst > 0) ? g_hoHyst : 0.05;
+    // ★清理（2026-09-22）★：删除三个「定义了但从未使用」的死变量，避免误导读者以为存在生效通路：
+    //   lastHo       —— 改用 m_hoHist.back() 在 DoHandover 内直接判乒乓；
+    //   reactMargin  —— predictive 分支直接用 g_hoHyst 判断（见下），本变量从未参与运算；
+    //   reactTtt     —— 曾取 5.0，但 cho 分支实际用「g_choTtt 或 12.0」（见下方 lead 计算），
+    //                   该 5.0 与实参不符，属历史遗留的误导项。
+    // 保留 reactCond：dqn / cho 分支的真实条件阈值（g_choCond 或 0.05）。
     double reactCond   = (g_choCond > 0) ? g_choCond : 0.05;
-    double reactTtt    = (g_choTtt > 0) ? g_choTtt : 5.0;
 
     if (g_hoPolicy == "predictive" || g_hoPolicy == "predictive_nopremig"){
       // 预测式（本职）：在预测 LOS 末端提前 ho_lead 决策（先建后断）；T8 业务感知给语音/图像额外提前量
@@ -1023,6 +1055,11 @@ private:
   // ★签名变更（审计修复）★：新增 losTrue（真实 LOS，区别于预测 LOS），用于中断计算。
   void DoHandover(uint32_t cand, double t, double candConnect, double losTrue,
                   double candLos, double tHo, bool doPreMigrate){
+    // ★P2 完整化（2026-09-22）★：每次切换执行时轮换凭证——epoch+1 → 重派生信令假名 →
+    // 哈希链单向推进。镜像 Python protocol.py 切换分支（term_epoch+1 → make_pseudo(epoch) → chain_next）。
+    // 原 RotateCredential() 仅有定义、全文件无调用（死代码）→ ns-3 轨「假名轮换次数」恒为 0，
+    // 与 Python 轨（每次切换轮换，实测=切换事件数）不一致，属声明特征未接通。
+    RotateCredential();
     double rg = rangeKm(g_termPos[m_nodeId], satPosAt(cand, t));
     double delay = rg / C_KM_S;
     // 预测失配（契约 2.1，与 Python 轨一致）：决策选中的候选 vs 执行时刻（服务星 LOS）
@@ -1405,7 +1442,7 @@ int main(int argc, char* argv[]){
   cmd.AddValue("preMigrate", "认证上下文预迁移开关(1/0)", preMigrate);
   cmd.AddValue("rngSeed", "随机种子", rngSeed);
   // ★T2 切换基线对比★
-  cmd.AddValue("hoPolicy", "切换策略(predictive/elevation/hysteresis/cho)", hoPolicy);
+  cmd.AddValue("hoPolicy", "切换策略(predictive/predictive_nopremig/cho/rel17/dqn/graph)", hoPolicy);
   cmd.AddValue("elevTh", "仰角阈值硬切换触发门限(度)", elevTh);
   cmd.AddValue("choCond", "CHO 条件阈值(score单位)", choCond);
   cmd.AddValue("choTtt", "CHO 时间窗TTT(s)", choTtt);
@@ -1438,6 +1475,22 @@ int main(int argc, char* argv[]){
   g_linkModelOn = (linkModelOn != 0); g_rngSeed = rngSeed;
   g_preMigrate = (preMigrate != 0);
   g_hoPolicy = hoPolicy;
+  // ★基线取值域白名单（2026-09-22）★：非法/拼错的策略 fail-fast，避免静默落入 else(cho) 分支
+  // 产出「看似正常、实为 cho」的错误结果（镜像 run_sim.py 的同类校验）。
+  {
+    const std::vector<std::string> kHo = {"predictive","predictive_nopremig","cho","rel17","dqn","graph"};
+    const std::vector<std::string> kRa = {"rel17_4step","twostep_precomp","msgarep_2step"};
+    if (std::find(kHo.begin(), kHo.end(), g_hoPolicy) == kHo.end()){
+      std::cerr << "[FATAL] 未知 hoPolicy=" << g_hoPolicy
+                << "；可选: predictive/predictive_nopremig/cho/rel17/dqn/graph" << std::endl;
+      std::exit(2);
+    }
+    if (std::find(kRa.begin(), kRa.end(), g_rachScheme) == kRa.end()){
+      std::cerr << "[FATAL] 未知 rachScheme=" << g_rachScheme
+                << "；可选: rel17_4step/twostep_precomp/msgarep_2step" << std::endl;
+      std::exit(2);
+    }
+  }
   g_elevTh = elevTh; g_choCond = choCond; g_choTtt = choTtt;
   g_nTerms = nTerms;  // Graph-KM 负载归一用
   g_t8PriorityOn = (t8PriorityOn != 0);
