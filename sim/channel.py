@@ -8,22 +8,15 @@
    缺 Rb 时"Eb/N0"实际是 C/N0，量纲错误（原值 66.8 dB 明显不合理）。已补全。
 3. 新增 BER 模型与「MAC 误码导致合法终端被误拒」的概率，这是**虚警率**的物理来源，
    使"仰角代价"从记账数字变为有后果的量。
+
+★ 2026-09-23 审计 ★：移除 3 个全仓无调用的历史函数（doppler_hz / propagation_delay_s /
+link_margin_db）——其功能由 orbit.py 的多普勒实算与链路预算路径承载；保留在用 API。
 """
 import math
 
 from .config import (CARRIER_FREQ_HZ, SPEED_OF_LIGHT, BOLTZMANN, EIRP_DBM,
                      GT_DBI_K, NOISE_TEMP_K, BIT_RATE_BPS, BER_MODEL,
                      ATM_ATTEN_SLOPE_DB, MASK_ANGLE_DEG)
-
-
-def doppler_hz(radial_velocity_km_s: float) -> float:
-    """径向速度(km/s, 远离为正) -> 多普勒频偏(Hz)。"""
-    return -CARRIER_FREQ_HZ * (radial_velocity_km_s * 1000.0) / SPEED_OF_LIGHT
-
-
-def propagation_delay_s(slant_km: float) -> float:
-    """单向传播时延(s)。"""
-    return slant_km * 1000.0 / SPEED_OF_LIGHT
 
 
 def free_space_loss_db(slant_km: float, freq_hz: float = CARRIER_FREQ_HZ) -> float:
@@ -101,9 +94,3 @@ def mac_fail_prob(slant_km: float, mac_bits: int,
     if p_bit >= 1.0:
         return 1.0
     return 1.0 - (1.0 - p_bit) ** mac_bits
-
-
-def link_margin_db(slant_km: float, required_ebno_db: float = 6.0,
-                   bit_rate_bps: float = BIT_RATE_BPS) -> float:
-    """链路余量(dB) = 实际 Eb/N0 − 解调门限。<=0 表示不可用。"""
-    return ebno_db(slant_km, bit_rate_bps) - required_ebno_db

@@ -45,7 +45,7 @@ cd <ns-3> && ./ns3 build scratch_leo_access
 ./ns3 run scratch_leo_access -- <参数...>
 ```
 
-> 注意：当前代码（`a1de2bf`，P1/P2 修复后）的 trace 契约已扩到 **16 列**，`leo_access.cc:1290` 需与 `sim/interfaces.py:15` 对齐；旧对照表（2026-09-01）记载的 14 列已过期。
+> 注意：当前代码（P1/P2 修复后；方法修复见 `43bf47d`。注：早期引用的 `a1de2bf` 已不在本仓对象库中）的 trace 契约已扩到 **17 列**（`service` 于 2026-09-23 加入），`.ns3_ref/leo_access.cc` 的输出表头需与 `sim/interfaces.py` 的 `TRACE_COLS` 严格对齐（列序不变）；旧对照表（2026-09-01）记载的 14 列已过期。
 
 ## 六、结论
 

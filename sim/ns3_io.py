@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 import numpy as np
 
 from .config import DATA_DIR, SIM_START_UTC, TIME_STEP_S
+from .interfaces import TRACE_COLS
 from .scenario import get_scenario
 from .data_sources import fetch_tle
 from .orbit import build_timescale, snap_cell, GRID_N, GRID_STEP_DEG
@@ -176,12 +177,9 @@ def write_ns3_scenario(sc, prov, params, out_json):
 
 
 # ----------------- 回采：解析 ns-3 真实 trace -----------------
-# ★一致性修复（2026-09-02 第 2 轮）★：补齐至 16 列（auth_result、ebno_db 为
-# 第一轮审计新增字段，leo_access.cc 与 sim/interfaces.py TRACE_COLS 均为 16 列）。
-TRACE_FIELDS = ["event_type", "terminal", "tag", "t_s", "serving_sat",
-                "target_sat", "value_ms", "doppler_hz", "slant_km",
-                "result", "predict_mismatch", "pingpong", "ho_el_cost_deg", "forged",
-                "auth_result", "ebno_db"]
+# ★单一来源（2026-09-23）★：回采字段表直接取 `sim/interfaces.TRACE_COLS`，
+# 不再本地复制一份（原 16 列副本会与契约漂移）。契约现为 17 列（含 `service`）。
+TRACE_FIELDS = list(TRACE_COLS)
 
 
 def parse_ns3_trace(out_csv):

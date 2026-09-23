@@ -60,10 +60,10 @@ AUTH_CPU_DERATE = 1000.0     # 星上抗辐照 CPU 相对仿真宿主的降频�
 # ---- RACH：四步基线的具名调度参数（★审计修复★）----
 # 原 step4_extra_ms=400.0 为单一无源常量，且使两步/四步成功率完全相同。
 # 现拆为：几何往返（由斜距实算）+ 两个具名 3GPP 调度定时器 + 前导竞争失败（机理）。
-RAR_WINDOW_MS = 160.0        # RAR 响应窗口(ms)【文献待补：3GPP TS 38.321 ra-ResponseWindow】
-CONTENTION_TIMER_MS = 200.0  # 竞争解决定时器(ms)【文献待补：3GPP TS 38.321 mac-ContentionResolutionTimer】
+RAR_WINDOW_MS = 160.0        # RAR 响应窗口(ms)【TS 38.321 §5.1.4 ra-ResponseWindow；160 ms 为仿真设定值】
+CONTENTION_TIMER_MS = 200.0  # 竞争解决定时器(ms)【TS 38.321 §5.1.5 ra-ContentionResolutionTimer；200 ms 为仿真设定值】
 N_PREAMBLE = 64              # 每时隙可用前导码数【标准：LTE/NR 64】
-# 兼容旧字段：step4_extra_ms 仅作为「无几何信息时的退化估计」保留，默认不再使用
+# 兼容旧字段（★2026-09-23 审计标注★：当前全仓无引用）——仅为兼容早期版本保留，可安全删除
 STEP4_FALLBACK_MS = 360.0
 
 # ---- 星历预测误差（★审计修复：使「预测式切换」可被证伪★）----
@@ -77,7 +77,6 @@ EPHEM_ERR_S = 5.0            # 预测 LOS 的标准差(s)：TLE 老化致星历�
 # ---- 切换：联合打分 + 迟滞 + 乒乓重定义（★审计修复★）----
 HO_W_EL = 0.5                # 联合打分中仰角权重【可扫描】
 HO_W_DWELL = 0.5             # 联合打分中剩余驻留权重【可扫描】
-HO_HYST_DEG = 0.0            # 迟滞(度)：新目标得分需超出该门限才切换【可扫描】
 PINGPONG_WINDOW_S = 60.0     # 乒乓判定窗口：窗口内切回曾服务过的星
 PINGPONG_MIN_GAP_S = 30.0    # 相邻两次切换间隔低于此值计为频繁切换
 # ★T2 调查结论（2026-09-16）★：曾试图以「候选最小剩余可见时长」过滤消除 predictive 的

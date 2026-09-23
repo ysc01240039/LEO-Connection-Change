@@ -1,0 +1,21 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-track:
+    name: Python 轨（契约 + 口径回归）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 安装依赖（版本锁定）
+        run: pip install -r requirements.txt
+      - name: 契约与口径回归测试
+        run: python -m unittest discover -s tests -v

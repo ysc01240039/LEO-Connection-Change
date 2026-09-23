@@ -5,6 +5,10 @@
   python run_ns3.py henan oneweb --seed 42
   python run_ns3.py wenchuan oneweb --ephem-err 30 --ho-lead 5   # 敏感性分析
 
+★ 可复现性（2026-09-23）★：ns-3 侧路径与 WSL 发行版名支持环境变量覆盖，换机无需改代码：
+  `NS3_DIR`（WSL 内 ns-3 根目录，默认 /home/mark/ns-3-dev）、`NS3_WSL_DISTRO`（默认 Ubuntu-24.04）、
+  `NS3_REPO_WSL`（本仓库的 WSL 路径，默认由本文件位置自动推导 → 免硬编码）。
+
 ★ 审计修复（2026-09-02）★
 1. **fail-fast**：原实现 WSL 调用失败仅打印 [WARN] 后**继续读取磁盘上的旧 trace**，
    把陈旧数据当新结果出报告（退出码 0，无任何标识）。现改为直接抛错终止。
@@ -14,6 +18,7 @@
    与 Python 轨同参透传，保证双轨可比。
 4. **产物隔离**：结果落在 data/sim/runs/<场景>_<种子>_<时间戳>_ns3/，不再覆盖。
 """
+import os
 import subprocess
 import sys
 import json
@@ -41,11 +46,17 @@ def win2wsl(p: str) -> str:
     return p
 
 
+# ★可复现性（2026-09-23）★：ns-3 侧运行环境支持环境变量覆盖（默认值 = 开发机）
+NS3_WSL_DISTRO = os.environ.get("NS3_WSL_DISTRO", "Ubuntu-24.04")
+NS3_DIR = os.environ.get("NS3_DIR", "/home/mark/ns-3-dev")
+NS3_REPO_WSL = os.environ.get("NS3_REPO_WSL") or win2wsl(str(Path(__file__).resolve().parent))
+
+
 def parse_args(argv):
     args = {"seed": 20260901, "no_viz": False, "ephem_err": None,
             "ho_lead": None, "w_el": None, "w_dwell": None, "hyst": None,
             "compromised": None, "prio_mode": None,
-            "ho_policy": "predictive", "elev_th": None, "cho_cond": None,
+            "ho_policy": "predictive", "cho_cond": None,
             "cho_ttt": None, "t8": None, "rach_scheme": None}
     pos, i = [], 0
     while i < len(argv):
@@ -66,13 +77,12 @@ def parse_args(argv):
             args["compromised"] = float(nxt); i += 2
         elif a == "--ho-policy" and nxt:
             args["ho_policy"] = nxt; i += 2
-        elif a == "--elev-th" and nxt:
-            # ★弃用提示（2026-09-22）★：elevation 基线已删除（见 exp/README.md §三），
-            # C++ 侧 g_elevTh 仅保留声明、无任何读取分支——本参数**无实际效果**。
-            # 保留仅为向后兼容旧命令，但不再静默：显式提示，避免「以为设了生效」的误判。
-            args["elev_th"] = float(nxt); i += 2
-            print(f"[WARN] --elev-th={nxt} 已弃用：elevation 基线已删除，该参数无任何效果；"
-                  f"切换策略请用 --ho-policy cho / rel17 / dqn / graph。", file=sys.stderr)
+        elif a == "--elev-th":
+            # ★移除（2026-09-23）★：elevation 基线及其 C++ 侧 `g_elevTh` 已删除
+            # （原为空转开关：有声明、有 CLI 透传、无任何读取分支）。
+            # 不再静默接受——直接 fail-fast，避免旧命令行「以为设了生效」。
+            raise SystemExit("[FATAL] --elev-th 已移除：不存在仰角阈值硬切换基线；"
+                             "切换策略请用 --ho-policy cho / rel17 / dqn / graph")
         elif a == "--cho-cond" and nxt:
             args["cho_cond"] = float(nxt); i += 2
         elif a == "--cho-ttt" and nxt:
@@ -99,7 +109,7 @@ def parse_args(argv):
 
 
 def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = False,
-         seed: int = 20260901, overrides=None, ho_policy="predictive", elev_th=None,
+         seed: int = 20260901, overrides=None, ho_policy="predictive",
          cho_cond=None, cho_ttt=None, t8_priority_on=None, rach_scheme=None):
     ov = {k: v for k, v in (overrides or {}).items() if v is not None}
     print(f"[1/5] 生成真实输入（TLE -> ECEF 星历 + 终端分布）")
@@ -127,7 +137,6 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
     rach_scheme = (rach_scheme if rach_scheme is not None
                    else sc.get("rach_scheme")
                    or ("rel17_4step" if sc.get("rach_steps", 2) >= 4 else "twostep_precomp"))
-    elev_th = elev_th if elev_th is not None else sc.get("elev_th", 10.0)
     cho_cond = cho_cond if cho_cond is not None else sc.get("cho_cond", 0.0)
     cho_ttt = cho_ttt if cho_ttt is not None else sc.get("cho_ttt", 0.0)
     t8 = t8_priority_on if t8_priority_on is not None else sc.get("t8_priority_on", True)
@@ -157,11 +166,11 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
     indir = win2wsl(str(ns3_io.NS3_IN))
     outdir = win2wsl(str(ns3_io.NS3_OUT))
     inner = (
-        "if ! cmp -s /mnt/e/pytorchFile/NationalCreation1/.ns3_ref/leo_access.cc "
-        "/home/mark/ns-3-dev/scratch/leo_access.cc 2>/dev/null; then "
-        "cp /mnt/e/pytorchFile/NationalCreation1/.ns3_ref/leo_access.cc "
-        "/home/mark/ns-3-dev/scratch/leo_access.cc; fi; "
-        "cd /home/mark/ns-3-dev && ./ns3 run \"leo_access "
+        f"if ! cmp -s {NS3_REPO_WSL}/.ns3_ref/leo_access.cc "
+        f"{NS3_DIR}/scratch/leo_access.cc 2>/dev/null; then "
+        f"cp {NS3_REPO_WSL}/.ns3_ref/leo_access.cc "
+        f"{NS3_DIR}/scratch/leo_access.cc; fi; "
+        f"cd {NS3_DIR} && ./ns3 run \"leo_access "
         f"--indir={indir} --outdir={outdir} "
         f"--maskDeg={params['mask_deg']} --simDur={params['sim_duration_s']} "
         f"--stepS={params['time_step_s']} --burstStart={params['burst_start_s']} "
@@ -184,13 +193,13 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
         f"--eirpDbm={EIRP_DBM} --gtDbiK={GT_DBI_K} --bitRateBps={BIT_RATE_BPS} "
         f"--rarWindowMs={RAR_WINDOW_MS} --contTimerMs={CONTENTION_TIMER_MS} "
         f"--nPreamble={sc.get('n_preamble', N_PREAMBLE)} "
-        f"--hoPolicy={ho_policy} --elevTh={elev_th} --choCond={cho_cond} --choTtt={cho_ttt} "
+        f"--hoPolicy={ho_policy} --choCond={cho_cond} --choTtt={cho_ttt} "
         f"--rachScheme={rach_scheme} "
         f"--t8PriorityOn={1 if t8 else 0} --preMigrate={pre_migrate} --linkModelOn=1\""
     )
-    run_cmd = f'wsl -d Ubuntu-24.04 -- bash -c "{inner}"'
+    run_cmd = f'wsl -d {NS3_WSL_DISTRO} -- bash -c "{inner}"'
     # ★审计修复：fail-fast★ —— WSL/ns-3 失败必须终止，禁止静默使用旧 trace 冒充新结果
-    r = subprocess.run(["wsl", "-d", "Ubuntu-24.04", "--", "bash", "-c", inner],
+    r = subprocess.run(["wsl", "-d", NS3_WSL_DISTRO, "--", "bash", "-c", inner],
                        capture_output=True, text=True, timeout=600,
                        encoding="utf-8", errors="replace")
     if r.returncode != 0:
@@ -199,12 +208,10 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
             f"  stderr 尾部: {r.stderr[-500:] if r.stderr else '(空)'}\n"
             f"  手动复现命令: {run_cmd}\n"
             f"  ★已禁止读取旧 trace 冒充新结果（审计修复 2026-09-02）★")
-    wall_s = None
-    out = r.stdout + r.stderr
-    for line in out.splitlines():
-        if "ns-3 调度墙钟时间=" in line:
-            wall_s = line.split("=")[-1].strip().rstrip("s")
-    for line in out.splitlines()[-8:]:
+    # ★修复（2026-09-23）★：上一轮清理未用局部变量 wall_s 时，误连带删除了
+    #   `out = r.stdout + r.stderr`，而此处仍引用 out → ns-3 轨**整轨不可运行**
+    #   （NameError）。现直接内联，与下方 [P2] 解析写法一致。
+    for line in (r.stdout + r.stderr).splitlines()[-8:]:
         print("      " + line)
 
     print(f"[3/5] 解析 ns-3 真实 trace ...")
@@ -229,7 +236,7 @@ def main(scenario_key: str = "wenchuan", group: str = "oneweb", no_viz: bool = F
                 except ValueError:
                     pass
     metrics = compute_metrics(trace, summary)
-    print("      指标：" + __import__("json").dumps(metrics, ensure_ascii=False))
+    print("      指标：" + json.dumps(metrics, ensure_ascii=False))
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     rundir = DATA_DIR / "runs" / f"{scenario_key}_s{seed}_ns3_{stamp}"
@@ -297,6 +304,6 @@ if __name__ == "__main__":
     gp = pos[1] if len(pos) > 1 else "oneweb"
     ov = {k: args[k] for k in ("ephem_err", "ho_lead", "w_el", "w_dwell", "hyst", "compromised", "prio_mode")}
     main(sk, gp, no_viz=args["no_viz"], seed=args["seed"], overrides=ov,
-         ho_policy=args["ho_policy"], elev_th=args["elev_th"], cho_cond=args["cho_cond"],
+         ho_policy=args["ho_policy"], cho_cond=args["cho_cond"],
          cho_ttt=args["cho_ttt"], t8_priority_on=args["t8"],
          rach_scheme=args["rach_scheme"])

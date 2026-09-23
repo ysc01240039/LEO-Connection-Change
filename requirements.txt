@@ -1,0 +1,9 @@
+# 面向应急救灾的低轨卫星-地面融合组网快速接入系统 —— Python 轨依赖（版本锁定）
+# 测试环境：Python 3.13（Windows 11 + WSL2；ns-3 轨构建见 docs/ns3构建说明.md）
+# 安装：pip install -r requirements.txt
+skyfield==1.55
+sgp4==2.27
+matplotlib==3.11.1
+pandas==3.0.5
+requests==2.34.2
+numpy==2.5.2

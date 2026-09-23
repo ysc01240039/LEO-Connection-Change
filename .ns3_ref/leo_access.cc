@@ -93,7 +93,6 @@ static double     g_hoHyst         = 0.0;    // 切换迟滞（score 单位）
 // （无预迁移、按各自真实触发语义在 LOS 段内决策），用于公平对照。
 static std::string g_hoPolicy      = "predictive"; // predictive | predictive_nopremig | cho | rel17 | dqn | graph
                                                    // （5 基线对比矩阵 + 1 消融臂；nopremig=同提前量但关闭星间预迁移）
-static double     g_elevTh         = 10.0;   // 仰角阈值硬切换触发门限(度)（已弃用，保留兼容）
 static double     g_choCond        = 0.0;    // 3GPP 条件切换(CHO) 条件阈值(score 单位)
 static double     g_choTtt         = 0.0;    // 3GPP 条件切换 TTT(s)
 static uint32_t   g_nTerms         = 1200;   // 终端总数（Graph-KM 负载归一）
@@ -683,7 +682,7 @@ public:
     g_trace << "ACCESS," << m_termIdx << "," << m_tag << "," << std::fixed
             << std::setprecision(3) << t << ",-1,-1,"
             << std::setprecision(2) << -1.0 << ",0.0,0.0,fail,0,0,0,"
-            << (m_forged?1:0) << "," << authResult << ",0.0\n";
+            << (m_forged?1:0) << "," << authResult << ",0.0," << m_service << "\n";
     m_accessed = true;
   }
 
@@ -1134,7 +1133,7 @@ private:
             << std::setprecision(3) << rg << "," << hoResult << ","
             << (mismatch?1:0) << "," << (pingpong?1:0) << ","
             << std::setprecision(2) << elCost << ",0,none,"
-            << std::setprecision(2) << (g_linkModelOn ? ebnoDb(rg) : 0.0) << "\n";
+            << std::setprecision(2) << (g_linkModelOn ? ebnoDb(rg) : 0.0) << "," << m_service << "\n";
     m_servingSat = cand;
     g_satLoad[cand]++;   // Graph-KM 负载记账（★镜像 Python sat_load★；累积语义，见文件头调查结论）
     m_servingLos = candLos;
@@ -1161,7 +1160,7 @@ private:
               << std::setprecision(1) << std::abs(h.dopplerHz) << ","
               << std::setprecision(3) << rg << ",success,0,0,0,"
               << (m_forged?1:0) << "," << authRes << ","
-              << std::setprecision(2) << (g_linkModelOn ? ebnoDb(rg) : 0.0) << "\n";
+              << std::setprecision(2) << (g_linkModelOn ? ebnoDb(rg) : 0.0) << "," << m_service << "\n";
       m_accessed = true;
       m_servingSat = h.satId;
       // 记录当前服务段 LOS（用于切换决策下界，★替代原 Tick 轮询★）
@@ -1393,8 +1392,8 @@ int main(int argc, char* argv[]){
   uint32_t preMigrate=1;   // D3：认证上下文预迁移开关（默认开启）
   uint64_t rngSeed=20260901;   // ★原固定 12345，现可配置（多种子/置信区间实验）★
   // ---- ★T2 切换基线对比（★镜像 sim/protocol.py ho_policy★）----
-  std::string hoPolicy="predictive";   // predictive | elevation | hysteresis | cho
-  double elevTh=10.0, choCond=0.0, choTtt=0.0;
+  std::string hoPolicy="predictive";   // predictive | predictive_nopremig | cho | rel17 | dqn | graph
+  double choCond=0.0, choTtt=0.0;
   int32_t t8PriorityOn=1;       // T8 业务感知切换开关（默认开，镜像 Python t8_priority_on）
 
   CommandLine cmd;
@@ -1443,7 +1442,6 @@ int main(int argc, char* argv[]){
   cmd.AddValue("rngSeed", "随机种子", rngSeed);
   // ★T2 切换基线对比★
   cmd.AddValue("hoPolicy", "切换策略(predictive/predictive_nopremig/cho/rel17/dqn/graph)", hoPolicy);
-  cmd.AddValue("elevTh", "仰角阈值硬切换触发门限(度)", elevTh);
   cmd.AddValue("choCond", "CHO 条件阈值(score单位)", choCond);
   cmd.AddValue("choTtt", "CHO 时间窗TTT(s)", choTtt);
   cmd.AddValue("t8PriorityOn", "T8 业务感知切换开关(1/0)", t8PriorityOn);
@@ -1491,7 +1489,7 @@ int main(int argc, char* argv[]){
       std::exit(2);
     }
   }
-  g_elevTh = elevTh; g_choCond = choCond; g_choTtt = choTtt;
+  g_choCond = choCond; g_choTtt = choTtt;
   g_nTerms = nTerms;  // Graph-KM 负载归一用
   g_t8PriorityOn = (t8PriorityOn != 0);
   g_runRng.seed((uint32_t)rngSeed);
@@ -1655,9 +1653,11 @@ int main(int argc, char* argv[]){
 
   // 打开 trace
   g_trace.open(outdir + "/access_trace.csv");
-  // ★契约 16 列（与 sim/interfaces.TRACE_COLS 严格一致）★
+  // ★契约 17 列（与 sim/interfaces.TRACE_COLS 严格一致）★
+  //   2026-09-23 新增第 17 列 service（业务类型 voice/image/sms）——原契约不含该列，
+  //   导致 ns-3 侧写 trace 时业务类型丢失、eval 按 sms 回落，T8 无法按业务拆分。
   g_trace << "event_type,terminal,tag,t_s,serving_sat,target_sat,value_ms,doppler_hz,slant_km,"
-          << "result,predict_mismatch,pingpong,ho_el_cost_deg,forged,auth_result,ebno_db\n";
+          << "result,predict_mismatch,pingpong,ho_el_cost_deg,forged,auth_result,ebno_db,service\n";
 
   std::cout << "  Simulator::Run() 开始（真实离散事件调度）..." << std::endl;
   auto t0 = std::chrono::high_resolution_clock::now();

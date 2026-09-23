@@ -24,9 +24,12 @@ def _plt():
         import matplotlib.pyplot as plt
         _PLT["module"] = plt
         candidates = [
-            r"C:/Windows/Fonts/simhei.ttf",      # 黑体
-            r"C:/Windows/Fonts/msyh.ttc",        # 微软雅黑
-            r"C:/Windows/Fonts/simsun.ttc",      # 宋体
+            r"C:/Windows/Fonts/simhei.ttf",      # 黑体（Windows）
+            r"C:/Windows/Fonts/msyh.ttc",        # 微软雅黑（Windows）
+            r"C:/Windows/Fonts/simsun.ttc",      # 宋体（Windows）
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",  # Noto CJK（Linux）
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",            # 文泉驿（Linux）
+            "/System/Library/Fonts/PingFang.ttc",                      # 苹方（macOS）
         ]
         for fp in candidates:
             if os.path.exists(fp):
@@ -125,8 +128,8 @@ def _provenance_rows():
         ("BER 模型", BER_MODEL, "【假设】", "决定虚警率量级"),
         ("MAC 长度", f"{AUTH_MAC_BYTES} 字节（32 bit）", "【假设】", "盲猜漏检概率 2^-32"),
         ("星上 CPU 降频系数", f"{AUTH_CPU_DERATE}×", "【假设·可扫描】", "决定认证引入时延"),
-        ("RAR 响应窗口", f"{RAR_WINDOW_MS} ms", "【文献待补 TS 38.321】", "四步附加时延组成"),
-        ("竞争解决定时器", f"{CONTENTION_TIMER_MS} ms", "【文献待补 TS 38.321】", "四步附加时延组成"),
+        ("RAR 响应窗口", f"{RAR_WINDOW_MS} ms", "TS 38.321 §5.1.4（仿真设定值）", "四步附加时延组成"),
+        ("竞争解决定时器", f"{CONTENTION_TIMER_MS} ms", "TS 38.321 §5.1.5（仿真设定值）", "四步附加时延组成"),
         ("前导码数 N_PREAMBLE", f"{N_PREAMBLE}", "【标准】", "决定四步竞争冲突概率"),
         ("选星权重 w_el / w_dwell", f"{HO_W_EL} / {HO_W_DWELL}", "【假设·可扫描】", "决定仰角代价"),
         ("链路模型开关", "开" if LINK_MODEL_ON else "关", "【开关】", "关=退化为纯几何基线"),
@@ -375,7 +378,7 @@ def write_report(metrics, provenance, scenario_name, cov_png, ho_png, out_path,
    但<b>设备与协议层参数（星上处理时延、EIRP、G/T、速率、定时器等）为建模假设</b>，
    已在上表逐项列出。标注为【假设】且影响核心结论的项（切换提前量、星历预测误差、
    星上 CPU 降频系数、选星权重）已支持命令行扫描，敏感性分析见
-   <code>perf/scan.py</code> 产出。</div>
+   <code>results/敏感性分析_20260903.json</code>（<code>run_sim.py</code> 敏感性扫描产出）+ <code>exp/plot_sensitivity.py</code>（绘图）。</div>
  </div>
  <div class="card">
   <h2>说明</h2>

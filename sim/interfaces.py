@@ -7,16 +7,21 @@
 ★ 审计修复（2026-09-02）★
 契约由 14 列扩展为 16 列，新增 `auth_result` / `ebno_db`，
 使认证判定结果与链路质量进入 trace，指标可审计（原仅在代码里判定，trace 无痕）。
+
+★ 跨轨可比性（2026-09-23）★
+契约由 16 列扩展为 17 列，新增 `service`（业务类型 voice/image/sms）。
+原契约不带该列 → ns-3 侧写 trace 时业务类型丢失，`eval` 按 `sms` 回落，
+T8 业务连续性无法按业务拆分（只能以 Python 轨为准）；补齐后两轨 T8 可比。
 """
 import json
 import csv
 from datetime import datetime, timezone
 
-# 契约 16 列（与 .ns3_ref/leo_access.cc 输出表头严格一致，勿改顺序）
+# 契约 17 列（与 .ns3_ref/leo_access.cc 输出表头严格一致，勿改顺序）
 TRACE_COLS = ["event_type", "terminal", "tag", "t_s", "serving_sat",
               "target_sat", "value_ms", "doppler_hz", "slant_km",
               "result", "predict_mismatch", "pingpong", "ho_el_cost_deg", "forged",
-              "auth_result", "ebno_db"]
+              "auth_result", "ebno_db", "service"]
 
 
 def write_scenario_json(path, scenario, provenance, windows):
