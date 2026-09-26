@@ -1,0 +1,447 @@
+/* ============================================================================
+   demo · 面向应急救灾的低轨卫星-地面融合组网快速接入系统
+   离线单页样式（零外部引用 / 零 web font）
+   配色约定：本方案=红（正向提升）｜Rel-17 基线=灰蓝｜达标=绿
+   ========================================================================== */
+:root{
+  --bg:#eef2f7; --panel:#ffffff; --panel-2:#f7f9fc; --ink:#152232; --ink-2:#3c4a5c;
+  --muted:#6b7c91; --line:#dbe3ec; --line-2:#eaeff5;
+  --ours:#c0392b; --ours-soft:#fdecea; --base:#78909c; --base-soft:#eef2f5;
+  --ok:#1e8449; --ok-soft:#e8f6ee; --warn:#b7791f; --warn-soft:#fdf6e3;
+  --info:#1f4e79; --info-soft:#eaf1f8; --ns3:#2c6e9b; --py:#7d5ba6;
+  --shadow:0 1px 2px rgba(21,34,50,.06),0 6px 18px rgba(21,34,50,.06);
+  --radius:10px; --mono:"Consolas","Cascadia Mono","DejaVu Sans Mono",monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--ink); font-size:14px; line-height:1.62;
+  font-family:"Microsoft YaHei","PingFang SC","Hiragino Sans GB","Segoe UI",system-ui,sans-serif;
+}
+a{color:var(--info);text-decoration:none}
+h1,h2,h3,h4{margin:0;font-weight:700;letter-spacing:.2px}
+code,.num,.mono{font-family:var(--mono)}
+
+/* ---------- 布局 ---------- */
+.app{display:grid;grid-template-columns:236px 1fr;min-height:100vh}
+.side{
+  position:sticky;top:0;align-self:start;height:100vh;overflow:auto;
+  background:#101a26;color:#c9d5e2;padding:14px 0 28px;border-right:1px solid #0a121b
+}
+.side h1{font-size:15px;color:#fff;padding:6px 16px 2px;line-height:1.4}
+.side .sub{font-size:11px;color:#7d8fa3;padding:0 16px 10px;line-height:1.5}
+.side .grp{font-size:11px;color:#6d8199;letter-spacing:1.5px;padding:12px 16px 4px}
+.side a.nav{
+  display:block;padding:6px 16px 6px 20px;color:#c2cfdd;font-size:13px;
+  border-left:3px solid transparent
+}
+.side a.nav:hover{background:#182637;color:#fff}
+.side a.nav.on{background:#1b2c40;color:#fff;border-left-color:var(--ours)}
+.side a.nav .tag{float:right;font-size:10px;color:#7d8fa3;font-family:var(--mono)}
+.side .foot{font-size:10.5px;color:#6d8199;padding:14px 16px 0;line-height:1.6}
+
+.main{padding:0 22px 60px;max-width:1560px}
+
+/* ---------- 顶栏 ---------- */
+.top{
+  position:sticky;top:0;z-index:40;background:rgba(238,242,247,.94);backdrop-filter:blur(6px);
+  border-bottom:1px solid var(--line);margin:0 -22px 16px;padding:10px 22px;
+  display:flex;align-items:center;gap:16px;flex-wrap:wrap
+}
+.top .ttl{font-size:14px;font-weight:700}
+.top .ttl small{font-weight:400;color:var(--muted);font-size:12px;margin-left:8px}
+.switch{display:flex;border:1px solid var(--line);border-radius:999px;overflow:hidden;background:#fff}
+.switch button{
+  border:0;background:#fff;padding:5px 14px;font-size:12.5px;cursor:pointer;color:var(--muted);
+  font-family:inherit
+}
+.switch button.on{background:var(--ours);color:#fff;font-weight:700}
+.switch button.on.base{background:var(--base)}
+.top .spacer{flex:1}
+.badge-auth{
+  font-size:11.5px;color:var(--info);background:var(--info-soft);border:1px solid #cfdeee;
+  padding:3px 10px;border-radius:999px
+}
+.badge-auth b{color:var(--ours)}
+
+/* ---------- 屏 ---------- */
+.screen{display:none}
+.screen.on{display:block;animation:fade .18s ease}
+@keyframes fade{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+.screen > header{padding:4px 2px 12px}
+.screen > header .idx{
+  font-family:var(--mono);font-size:11px;color:#fff;background:var(--info);
+  padding:2px 7px;border-radius:5px;margin-right:9px;vertical-align:2px
+}
+.screen > header h2{display:inline;font-size:19px}
+.screen > header p{margin:6px 0 0;color:var(--muted);font-size:13px;max-width:1100px}
+
+/* ---------- 卡片 ---------- */
+.card{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  box-shadow:var(--shadow);margin:0 0 14px;overflow:hidden
+}
+.card-hd{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:9px 14px;border-bottom:1px solid var(--line-2);background:var(--panel-2)
+}
+.card-hd h3{font-size:13.5px}
+.card-hd .spacer{flex:1}
+.card-bd{padding:14px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+@media (max-width:1180px){.grid2,.grid3,.grid4{grid-template-columns:1fr}}
+
+/* ---------- 数字与徽标 ---------- */
+.num{font-weight:700;letter-spacing:.2px}
+.num.ours{color:var(--ours)}
+.num.base{color:var(--base)}
+.num.big{font-size:26px;line-height:1.2}
+.num.mid{font-size:18px}
+.unit{font-size:.72em;color:var(--muted);font-weight:400;margin-left:2px}
+.badges{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.bd{
+  font-size:10.5px;font-family:var(--mono);padding:1.5px 7px;border-radius:999px;
+  border:1px solid var(--line);background:#fff;color:var(--muted);white-space:nowrap
+}
+.bd.run{color:var(--info);border-color:#cfdeee;background:var(--info-soft)}
+.bd.ours{color:var(--ours);border-color:#f0c9c4;background:var(--ours-soft)}
+.bd.base{color:#5d707d;border-color:#d7e0e6;background:var(--base-soft)}
+.bd.ok{color:var(--ok);border-color:#c6e6d3;background:var(--ok-soft)}
+.bd.warn{color:var(--warn);border-color:#ecd9a8;background:var(--warn-soft)}
+.bd.sch{color:#8a5a00;border-color:#e8d29a;background:#fff9e6}
+
+/* ---------- KPI ---------- */
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+     padding:12px 14px;box-shadow:var(--shadow)}
+.kpi .lab{font-size:12px;color:var(--muted);margin-bottom:2px}
+.kpi .hint{font-size:11px;color:var(--muted);margin-top:4px}
+
+/* ---------- 表格 ---------- */
+.tb-wrap{width:100%;overflow-x:auto}
+table.tb{width:100%;border-collapse:collapse;font-size:12.5px}
+table.tb th,table.tb td{border-bottom:1px solid var(--line-2);padding:6px 9px;text-align:right}
+table.tb th{background:var(--panel-2);color:var(--ink-2);font-weight:700;white-space:nowrap}
+table.tb th:first-child,table.tb td:first-child{text-align:left}
+table.tb tr:hover td{background:#fafcfe}
+table.tb td.pick{background:var(--ours-soft)}
+table.tb tr.total td{font-weight:700;border-top:2px solid var(--line)}
+.delta.up{color:var(--ours);font-weight:700}
+.delta.down{color:var(--ok);font-weight:700}
+.delta.flat{color:var(--muted)}
+
+/* ---------- 条形对比 ---------- */
+.bars{display:flex;flex-direction:column;gap:9px}
+.brow{display:grid;grid-template-columns:150px 1fr 132px;gap:10px;align-items:center}
+.brow .bl{font-size:12.5px;color:var(--ink-2)}
+.brow .bt{position:relative;height:20px;background:var(--panel-2);border-radius:4px;overflow:hidden}
+.brow .fill{position:absolute;left:0;top:0;bottom:0;border-radius:4px}
+.fill.ours{background:linear-gradient(90deg,#d4544a,var(--ours))}
+.fill.mid{background:linear-gradient(90deg,#e59a92,#cf6a5e)}
+.fill.base{background:linear-gradient(90deg,#9aacb6,var(--base))}
+.fill.ok{background:linear-gradient(90deg,#4fa97a,var(--ok))}
+.brow .bv{text-align:right;font-size:12.5px}
+.logwrap{position:relative}
+
+/* ---------- 漏斗 ---------- */
+.funnel{width:100%;height:auto;display:block}
+.fstage{fill:#fff;stroke:var(--line);cursor:default}
+.fstage:hover{stroke:var(--ours)}
+.flab{font-size:12px;fill:var(--ink)}
+.fnum{font-size:14px;font-weight:700;font-family:var(--mono);fill:var(--ink)}
+.fsub{font-size:10.5px;fill:var(--muted)}
+.fdrop{font-size:11px;fill:var(--ours);font-family:var(--mono)}
+
+/* ---------- 示意水印 ---------- */
+.schematic{position:relative;background:
+  repeating-linear-gradient(45deg,#fcfcfd 0 10px,#f7f9fb 10px 20px);
+  border:1px dashed #cfd8e3;border-radius:8px;padding:10px}
+.wm{
+  font-size:10.5px;color:#8a5a00;background:#fff4d6;border:1px solid #e8d29a;
+  padding:1px 7px;border-radius:999px;display:inline-block
+}
+.schematic .diag{width:100%;height:auto;display:block}
+
+/* ---------- 时间线 ---------- */
+.tl{width:100%;height:auto;display:block;background:#fff;border:1px solid var(--line-2);border-radius:6px}
+.tl-legend{font-size:11.5px;color:var(--muted);display:flex;gap:14px;flex-wrap:wrap;margin-top:6px}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+.ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.ctl button{
+  border:1px solid var(--line);background:#fff;border-radius:6px;padding:3px 12px;
+  font-size:12.5px;cursor:pointer;color:var(--ink-2);font-family:inherit
+}
+.ctl button:hover{border-color:var(--ours);color:var(--ours)}
+.ctl input[type=range]{width:190px}
+.ctl .val{font-family:var(--mono);font-size:12px;color:var(--ours);min-width:62px;display:inline-block}
+
+/* ---------- 侧栏抽屉（溯源） ---------- */
+.drawer{
+  position:fixed;top:0;right:0;width:430px;max-width:92vw;height:100vh;background:#fff;
+  border-left:1px solid var(--line);box-shadow:-8px 0 28px rgba(21,34,50,.14);
+  transform:translateX(101%);transition:transform .2s ease;z-index:60;overflow:auto;padding:16px 18px 40px
+}
+.drawer.on{transform:none}
+.drawer h3{font-size:15px;margin-bottom:4px}
+.drawer .k{font-size:11.5px;color:var(--muted);margin-top:10px}
+.drawer .v{font-family:var(--mono);font-size:12px;word-break:break-all;background:var(--panel-2);
+           border:1px solid var(--line-2);border-radius:6px;padding:6px 8px;margin-top:2px}
+.drawer .close{float:right;cursor:pointer;color:var(--muted);font-size:18px;line-height:1}
+[data-metric]{cursor:pointer;border-bottom:1px dotted #b9c6d4}
+[data-metric]:hover{background:#fff6d5}
+.pickable{cursor:pointer;border-bottom:1px dotted #b9c6d4}
+
+/* ---------- 3D ---------- */
+.gl-wrap{position:relative;background:#080d14;border-radius:8px;overflow:hidden}
+canvas.gl{display:block;width:100%;height:460px}
+.gl-hud{position:absolute;left:12px;bottom:10px;color:#9fb3c8;font-size:11.5px;font-family:var(--mono);
+        text-shadow:0 1px 3px #000}
+.gl-hud b{color:#fff}
+.gl-deg{position:absolute;right:12px;top:10px;color:#ffd479;font-size:11px;font-family:var(--mono)}
+
+/* ---------- 杂项 ---------- */
+.note{font-size:11.5px;color:var(--muted);margin-top:8px;line-height:1.65}
+.note b{color:var(--ink-2)}
+ul.tight{margin:6px 0 0 18px;padding:0}
+ul.tight li{margin:3px 0;font-size:12.5px}
+.heat{display:grid;grid-template-columns:repeat(5,1fr);gap:4px}
+.heat div{aspect-ratio:1/1;border-radius:4px;display:flex;align-items:center;justify-content:center;
+          font-size:11px;font-family:var(--mono);color:#fff}
+.chart{width:100%;height:330px}
+.chart.sm{height:270px}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--ink-2);margin-bottom:6px}
+.legend i{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:5px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap}
+.tabs button{border:1px solid var(--line);background:#fff;border-radius:999px;padding:3px 12px;
+             font-size:12px;cursor:pointer;font-family:inherit;color:var(--muted)}
+.tabs button.on{background:var(--info);border-color:var(--info);color:#fff}
+h4.sec{font-size:13px;margin:14px 0 6px;color:var(--ink-2)}
+.pill-row{display:flex;gap:8px;flex-wrap:wrap}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;font-size:12.5px}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;font-family:var(--mono)}
+.blocker{border-left:4px solid var(--ours);background:var(--ours-soft);padding:10px 12px;border-radius:0 8px 8px 0}
+.blocker.gray{border-left-color:var(--base);background:var(--base-soft)}
+
+/* ---------- 对比开关：本方案 ↔ Rel-17 基线（只改呈现侧重，不改数值） ---------- */
+body[data-mode="base"] .num.ours{color:var(--base);opacity:.85}
+body[data-mode="base"] .num.base{color:var(--ours);font-weight:700}
+body[data-mode="base"] .fill.ours{background:linear-gradient(90deg,#9aacb6,var(--base))}
+body[data-mode="base"] .fill.mid{background:linear-gradient(90deg,#c3cdd4,#a8b6c0)}
+body[data-mode="base"] .fill.base{background:linear-gradient(90deg,#d4544a,var(--ours))}
+body[data-mode="base"] .delta.up{color:var(--ok)}
+body[data-mode="base"] .snode[style*="#fdecea"]{background:#fff !important}
+
+/* ============================================================================
+   动画主线版新增样式（视觉主体 .stage / 控制条 / 对撞条 / 甘特 / 泄漏柱 / 折叠）
+   ========================================================================== */
+.stage-svg{width:100%;height:auto;display:block;background:#fff;border:1px solid var(--line-2);border-radius:8px}
+.anim .stage-svg{background:linear-gradient(180deg,#fdfefe,#f8fbfe)}
+.seqwrap{margin:0 0 10px}
+.cap{font-size:13px;color:var(--ink-2);line-height:1.7;margin-top:10px;padding-left:10px;border-left:3px solid var(--ours)}
+.cap .dim{color:var(--muted);font-size:12px}
+.s-lab{font-size:11.5px;fill:#5b6b7f;font-family:inherit}
+.s-sub{font-size:11.5px;fill:#6b7c91;font-family:inherit}
+.s-strong{font-size:13px;font-weight:700;fill:#152232;font-family:inherit}
+.s-stn{font-size:22px;font-weight:700;fill:#3c4a5c;font-family:var(--mono)}
+.s-num{font-size:13px;font-weight:700;fill:#152232;font-family:var(--mono)}
+
+/* 动画控制条 */
+.abar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px;
+      padding:7px 10px;background:var(--panel-2);border:1px solid var(--line-2);border-radius:8px}
+.abar button{border:1px solid var(--line);background:#fff;border-radius:6px;padding:3px 12px;
+             font-size:12.5px;cursor:pointer;font-family:inherit;color:var(--ink-2)}
+.abar button:hover{border-color:var(--ours);color:var(--ours)}
+.abar input[type=range]{flex:1;min-width:180px;accent-color:var(--ours)}
+.abar .aread{font-size:12.5px;color:var(--ink);min-width:210px}
+.abar .anote{font-size:11.5px;color:var(--muted)}
+
+/* 揭示（数字只在「揭示」时出现，值始终是真值） */
+.kpi.reveal{opacity:.25;transform:translateY(4px);transition:opacity .5s ease,transform .5s ease}
+.kpi.reveal.on{opacity:1;transform:none}
+
+/* 左右分栏（如 3D + 甘特） */
+.split{display:grid;grid-template-columns:minmax(420px,44%) 1fr;gap:14px;align-items:start}
+@media (max-width:1280px){.split{grid-template-columns:1fr}}
+
+/* 对撞条（结果对比） */
+.vs{display:flex;flex-direction:column;gap:14px}
+.vsrow{display:grid;grid-template-columns:150px 1fr 260px;gap:12px;align-items:center}
+.vsrow .vsl{font-size:13px;font-weight:700;color:var(--ink)}
+.vsbars{display:flex;flex-direction:column;gap:5px}
+.vsb{position:relative;height:22px;background:var(--panel-2);border-radius:4px;overflow:hidden}
+.vsb .fill{position:absolute;left:0;top:0;bottom:0;border-radius:4px;transition:width .7s cubic-bezier(.2,.8,.2,1)}
+.vsv{position:absolute;right:8px;top:3px;font-family:var(--mono);font-size:12.5px}
+.vsd{font-size:12.5px;color:var(--ink-2)}
+@media (max-width:1100px){.vsrow{grid-template-columns:1fr}}
+
+/* T8 三条提前量时间轴 */
+.tl3{display:flex;flex-direction:column;gap:10px}
+.tl3row{display:grid;grid-template-columns:70px 1fr 250px;gap:12px;align-items:center}
+.tl3l{font-size:13px;font-weight:700}
+.tl3b{position:relative;height:24px;background:var(--panel-2);border-radius:4px;overflow:hidden}
+.tl3b .fill{position:absolute;left:0;top:0;bottom:0;border-radius:4px}
+.tl3t{position:absolute;left:10px;top:4px;font-size:12px;color:#fff;font-weight:700}
+.tl3v{font-family:var(--mono);font-size:12.5px;text-align:right}
+
+/* 泄露占比柱（可证伪） */
+.leak{display:flex;gap:34px;align-items:flex-end;height:180px;padding:0 12px;margin-top:6px}
+.leakc{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}
+.leakc .lb{width:64px;background:linear-gradient(180deg,#e0715f,var(--ours));border-radius:5px 5px 0 0;
+           transition:height .7s ease}
+.leakc.on .lb{background:linear-gradient(180deg,#2f9e63,#1e8449);box-shadow:0 0 0 3px rgba(30,132,73,.18)}
+.leakc .lt{font-family:var(--mono);font-size:13px;font-weight:700;margin-top:6px}
+.leakc .lx{font-size:11.5px;color:var(--muted)}
+
+/* 扫描条覆盖层 */
+.scanwrap{position:relative}
+.scanwrap .scan{width:100%;height:8px;display:block;margin-bottom:6px}
+.scanwrap .scan line{transform-box:fill-box}
+
+/* 页面内页签 */
+.tabbox{margin-top:4px}
+.tabs2{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.tabs2 button{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 15px;
+              font-size:12.5px;cursor:pointer;font-family:inherit;color:var(--muted)}
+.tabs2 button.on{background:var(--info);border-color:var(--info);color:#fff;font-weight:700}
+.tabpane{display:none}
+.tabpane.on{display:block;animation:fade .18s ease}
+
+/* 折叠块（附录） */
+.fold{border:1px solid var(--line);border-radius:8px;background:#fff;margin-bottom:10px;overflow:hidden}
+.fold>summary{cursor:pointer;padding:10px 14px;font-size:13.5px;font-weight:700;background:var(--panel-2);
+              list-style:none;display:flex;align-items:center;gap:10px}
+.fold>summary::-webkit-details-marker{display:none}
+.fold>summary::before{content:'▸';color:var(--ours);font-size:12px}
+.fold[open]>summary::before{content:'▾'}
+.fold .fbd{font-size:11px;font-weight:400;color:var(--muted);font-family:var(--mono)}
+.fold-bd{padding:12px 14px 4px}
+
+/* 三列说明卡（边界页） */
+.colcard{background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;box-shadow:var(--shadow)}
+.colcard h4{font-size:13px;margin-bottom:6px;color:var(--info)}
+.colcard ul{margin-left:16px}
+.colcard li{font-size:12.5px;margin:5px 0;line-height:1.6}
+
+/* 网格 3/4 列在动画版中更紧凑 */
+.grid3{gap:12px}
+.grid4{gap:12px}
+.kpi .lab{font-size:12px}
+.num.big{font-size:24px}
+
+/* ============================================================================
+   动画主线版新增样式（视觉主体 .stage / 控制条 / 对撞条 / 甘特 / 泄漏柱 / 折叠）
+   ========================================================================== */
+.stage-svg{width:100%;height:auto;display:block;background:#fff;border:1px solid var(--line-2);border-radius:8px}
+.anim .stage-svg{background:linear-gradient(180deg,#fdfefe,#f8fbfe)}
+.seqwrap{margin:0 0 10px}
+.cap{font-size:13px;color:var(--ink-2);line-height:1.7;margin-top:10px;padding-left:10px;border-left:3px solid var(--ours)}
+.cap .dim{color:var(--muted);font-size:12px}
+.s-lab{font-size:11.5px;fill:#5b6b7f;font-family:inherit}
+.s-sub{font-size:11.5px;fill:#6b7c91;font-family:inherit}
+.s-strong{font-size:13px;font-weight:700;fill:#152232;font-family:inherit}
+.s-stn{font-size:22px;font-weight:700;fill:#3c4a5c;font-family:var(--mono)}
+.s-num{font-size:13px;font-weight:700;fill:#152232;font-family:var(--mono)}
+
+/* 动画控制条 */
+.abar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px;
+      padding:7px 10px;background:var(--panel-2);border:1px solid var(--line-2);border-radius:8px}
+.abar button{border:1px solid var(--line);background:#fff;border-radius:6px;padding:3px 12px;
+             font-size:12.5px;cursor:pointer;font-family:inherit;color:var(--ink-2)}
+.abar button:hover{border-color:var(--ours);color:var(--ours)}
+.abar input[type=range]{flex:1;min-width:180px;accent-color:var(--ours)}
+.abar .aread{font-size:12.5px;color:var(--ink);min-width:210px}
+.abar .anote{font-size:11.5px;color:var(--muted)}
+
+/* 揭示（数字只在「揭示」时出现，值始终是真值） */
+.kpi.reveal{opacity:.25;transform:translateY(4px);transition:opacity .5s ease,transform .5s ease}
+.kpi.reveal.on{opacity:1;transform:none}
+
+/* 左右分栏（如 3D + 甘特） */
+.split{display:grid;grid-template-columns:minmax(420px,44%) 1fr;gap:14px;align-items:start}
+@media (max-width:1280px){.split{grid-template-columns:1fr}}
+
+/* 对撞条（结果对比） */
+.vs{display:flex;flex-direction:column;gap:14px}
+.vsrow{display:grid;grid-template-columns:150px 1fr 260px;gap:12px;align-items:center}
+.vsrow .vsl{font-size:13px;font-weight:700;color:var(--ink)}
+.vsbars{display:flex;flex-direction:column;gap:5px}
+.vsb{position:relative;height:22px;background:var(--panel-2);border-radius:4px;overflow:hidden}
+.vsb .fill{position:absolute;left:0;top:0;bottom:0;border-radius:4px;transition:width .7s cubic-bezier(.2,.8,.2,1)}
+.vsv{position:absolute;right:8px;top:3px;font-family:var(--mono);font-size:12.5px}
+.vsd{font-size:12.5px;color:var(--ink-2)}
+@media (max-width:1100px){.vsrow{grid-template-columns:1fr}}
+
+/* T8 三条提前量时间轴 */
+.tl3{display:flex;flex-direction:column;gap:10px}
+.tl3row{display:grid;grid-template-columns:70px 1fr 250px;gap:12px;align-items:center}
+.tl3l{font-size:13px;font-weight:700}
+.tl3b{position:relative;height:24px;background:var(--panel-2);border-radius:4px;overflow:hidden}
+.tl3b .fill{position:absolute;left:0;top:0;bottom:0;border-radius:4px}
+.tl3t{position:absolute;left:10px;top:4px;font-size:12px;color:#fff;font-weight:700}
+.tl3v{font-family:var(--mono);font-size:12.5px;text-align:right}
+
+/* 泄露占比柱（可证伪） */
+.leak{display:flex;gap:34px;align-items:flex-end;height:180px;padding:0 12px;margin-top:6px}
+.leakc{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}
+.leakc .lb{width:64px;background:linear-gradient(180deg,#e0715f,var(--ours));border-radius:5px 5px 0 0;
+           transition:height .7s ease}
+.leakc.on .lb{background:linear-gradient(180deg,#2f9e63,#1e8449);box-shadow:0 0 0 3px rgba(30,132,73,.18)}
+.leakc .lt{font-family:var(--mono);font-size:13px;font-weight:700;margin-top:6px}
+.leakc .lx{font-size:11.5px;color:var(--muted)}
+
+/* 扫描条覆盖层 */
+.scanwrap{position:relative}
+.scanwrap .scan{width:100%;height:8px;display:block;margin-bottom:6px}
+.scanwrap .scan line{transform-box:fill-box}
+
+/* 页面内页签 */
+.tabbox{margin-top:4px}
+.tabs2{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.tabs2 button{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 15px;
+              font-size:12.5px;cursor:pointer;font-family:inherit;color:var(--muted)}
+.tabs2 button.on{background:var(--info);border-color:var(--info);color:#fff;font-weight:700}
+.tabpane{display:none}
+.tabpane.on{display:block;animation:fade .18s ease}
+
+/* 折叠块（附录） */
+.fold{border:1px solid var(--line);border-radius:8px;background:#fff;margin-bottom:10px;overflow:hidden}
+.fold>summary{cursor:pointer;padding:10px 14px;font-size:13.5px;font-weight:700;background:var(--panel-2);
+              list-style:none;display:flex;align-items:center;gap:10px}
+.fold>summary::-webkit-details-marker{display:none}
+.fold>summary::before{content:'▸';color:var(--ours);font-size:12px}
+.fold[open]>summary::before{content:'▾'}
+.fold .fbd{font-size:11px;font-weight:400;color:var(--muted);font-family:var(--mono)}
+.fold-bd{padding:12px 14px 4px}
+
+/* 三列说明卡（边界页） */
+.colcard{background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;box-shadow:var(--shadow)}
+.colcard h4{font-size:13px;margin-bottom:6px;color:var(--info)}
+.colcard ul{margin-left:16px}
+.colcard li{font-size:12.5px;margin:5px 0;line-height:1.6}
+
+/* 网格 3/4 列在动画版中更紧凑 */
+.grid3{gap:12px}
+.grid4{gap:12px}
+.kpi .lab{font-size:12px}
+.num.big{font-size:24px}
+
+/* 动画内部文字（分段标签等） */
+.seglab{fill:#fff;font-size:10.5px;font-family:var(--mono);font-weight:700}
+
+/* 3D HUD：限制宽度避免溢出画布 */
+.gl-hud{left:10px;right:10px;bottom:8px;font-size:10.5px;line-height:1.5}
+.gl-deg{font-size:10.5px;max-width:60%;text-align:right}
+
+/* A2 站点行（与 SVG 四个站点等距对齐） */
+.stnrow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:6px}
+.stnc{padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;
+      opacity:.28;transform:translateY(4px);transition:opacity .45s ease,transform .45s ease,border-color .45s ease}
+.stnc.on{opacity:1;transform:none;border-color:#e8b8b2;background:var(--ours-soft)}
+.stnl{font-size:11.5px;color:var(--muted)}
+.stnv{font-size:12.5px;margin-top:2px;color:var(--ink)}
+
+/* 图内小标题 */
+.chart-t{font-size:12.5px;font-weight:700;color:var(--ink-2);margin-bottom:2px}
+.chart.sm{height:250px}

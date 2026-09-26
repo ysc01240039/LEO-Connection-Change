@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>负向 fixture（应 FAIL）</title></head>
+<body>
+<h1>故意造错的页面</h1>
+
+<!-- 错 1：数字与 DEMO_DATA 不符，且是任务书废弃值 12.02 -->
+<div data-runid="bad_fixture">
+  <span data-metric="切换总时延" data-value="12.02">12.02 ms</span>
+</div>
+
+<!-- 错 2：完全没有 data-runid 祖先 -->
+<div>
+  <span data-metric="基线" data-value="381.0">381.0 ms</span>
+</div>
+
+<!-- 错 3：指标键在 DEMO_DATA 中不存在 -->
+<span data-metric="不存在的指标" data-value="1.0" data-runid="x">1.0</span>
+
+<script>
+window.DEMO_DATA = { metrics: { "切换总时延": 12.06, "基线": 381.0 } };
+undefinedFunctionABC();   /* 错 4：JS 运行时错误 */
+</script>
+</body></html>

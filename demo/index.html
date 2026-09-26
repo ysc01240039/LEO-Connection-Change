@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="generator" content="demo/tools/build_demo_data.py + demo/js/*.js"/>
+<title>天权 · 面向应急救灾的低轨卫星-地面融合组网快速接入系统 · 演示</title>
+<!-- 零外部引用：无 CDN、无 web font、无后端。断网双击即开。 -->
+<link rel="stylesheet" href="css/app.css"/>
+</head>
+<body data-mode="ours">
+
+<div class="app">
+  <aside class="side">
+    <h1>天权 · LEO 直连应急组网</h1>
+    <div class="sub">面向应急救灾的低轨卫星-地面融合组网快速接入系统<br/>双轨仿真（Python + ns-3）成果演示</div>
+    <div id="nav"></div>
+    <div class="foot">
+      数据权威：<span class="mono">docs/双轨交叉验证对照表.md</span><br/>
+      页面只读 <span class="mono">demo/data.js</span>，零硬编码。<br/>
+      断网可放 · 零 CDN · 零 JS 错误（自动自检）。
+    </div>
+  </aside>
+
+  <div class="main">
+    <div class="top">
+      <div class="ttl">演示<small>5 分钟主线：A1 一屏看懂 → A2 方法全景 → A3/A4/A5 三机制 → A6 结果 → A8 边界（A7 与附录备查）</small></div>
+      <div class="spacer"></div>
+      <div class="switch" role="group" aria-label="对比开关">
+        <button type="button" data-mode="ours" class="on" onclick="DEMO.setMode('ours')">本方案</button>
+        <button type="button" data-mode="base" onclick="DEMO.setMode('base')">Rel-17 基线</button>
+      </div>
+      <span class="badge-auth">数字权威：<b>对照表</b>（硬要求①）· 每图带 run_id（硬要求②）</span>
+    </div>
+
+    <div id="mode-banner" style="display:none;margin:0 0 12px;padding:8px 12px;border-radius:8px;
+         background:#eef2f5;border:1px solid #d7e0e6;color:#3c4a5c;font-size:12.5px">
+      当前视图：<b>Rel-17 基线口径</b> —— 基线列已高亮，本方案列弱化。切换回「本方案」可复原。
+      <span class="note" style="display:inline;margin-left:8px">（该开关只改变<b>呈现侧重</b>，不改变任何数值。）</span>
+    </div>
+
+    <div id="main"></div>
+  </div>
+</div>
+
+<div class="drawer" id="drawer"></div>
+
+<script src="vendor/echarts.min.js"></script>
+<script src="data.js"></script>
+<script src="assets/earth_texture.js"></script>
+<script src="js/core.js"></script>
+<script src="js/anim.js"></script>
+<script src="js/charts.js"></script>
+<script src="js/webgl3d.js"></script>
+<script src="js/scenes.js"></script>
+</body>
+</html>

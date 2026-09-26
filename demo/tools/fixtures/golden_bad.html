@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"/><title>负向回归用例 · 校验自检脚本能抓错</title></head>
+<body>
+<!-- 用途：验证 selfcheck_audit.js 的「独立副本 data-golden」与「示意水印」两项新检查**不是摆设**。
+     本文件**故意**埋入 3 类错误，自检必须 FAIL（退出码 1）：
+       ① data-value 与 data.js 不符（数字错）
+       ② data-golden 与 data-value 不符（键映射错位）
+       ③ .schematic 缺「示意」字样（诚实红线）
+     运行：node demo/tools/selfcheck_audit.js demo/tools/fixtures/golden_bad.html -->
+<script src="../../data.js"></script>
+<div>
+  <span class="num" data-metric="marg/premig_on/切换总时延均值_ms" data-value="99.9"
+        data-golden="12.06" data-runid="x">99.9 ms</span>
+  <span class="num" data-metric="py/wenchuan_storm2/接入时延均值_ms" data-value="193.44"
+        data-golden="652.80" data-runid="y">193.44 ms</span>
+  <div class="schematic">这里是一张机理图，但忘了写水印。</div>
+  <div>废弃值检查：12.02</div>
+</div>
+</body></html>

@@ -1,0 +1,27 @@
+# demo/vendor 第三方库校验清单（入库前必校验字节数 + sha256）
+# 生成：2026-09-25　最后更新：2026-09-26（施工期复核）
+# 校验方式：sha256sum demo/vendor/*
+#
+# 用途：防止「下载被截断 → 页面 xxx is not defined → 白屏」事故（本轮已实测踩到过）。
+
+echarts.min.js    bytes=1030855   OK   sha256=e84270bd0cd5bdf60fefc26d00c2a391cb2e81f4d26a7a9ee16185a54773a3cf
+                  来源: https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js
+                  许可: Apache-2.0
+                  用途: 6 张交互图表（S4 两步vs四步 / S6 拦截率曲线 / S11 T8 分组柱 /
+                        S15 敏感性三曲线 / S16 多种子 / S18 抗冲击）
+                  必要性: 页面**必需**（index.html 显式引用）
+
+# ---------------------------------------------------------------------------
+# ★2026-09-26 决策变更：three.min.js 不再随包分发（文件已从 demo/vendor/ 移除）★
+#
+# 原因：3D 屏最终采用**原生 WebGL 手写**（见 docs/demo自检能力与优化登记.md I-03/D-3），
+#       three.min.js 成为未被任何文件引用的 0.61 MB 死资产 —— 与「无死代码」纪律冲突，
+#       且会削弱「零 3D 库依赖」这一更强的工程叙事。
+#
+# 如需恢复（例如日后要把 3D 升级为带光照/阴影的拟真档），本地执行：
+#   curl -L -o demo/vendor/three.min.js https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.min.js
+# 并核对下列校验值（不符即视为下载残缺，必须重下）：
+#   three.min.js  bytes=607784    sha256=f34446bf875b5fb0dcd93819ffe1d9e182d46634ee855f5d904c6c4ac7cdbc95
+#   （选 r147 而非 r150+：后者的 min 版会在控制台打印弃用警告，污染「零 JS 错误」自检）
+# 恢复后须同步：demo/README.md 的表单、许可证清单，以及入库体积统计。
+# ---------------------------------------------------------------------------

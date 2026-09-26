@@ -8,7 +8,12 @@ logs/
 姚世宸_前置任务清单.md
 
 # 第三方仿真模块 vendor（ns3-ntn-toolkit 等，已克隆但未构建/未集成）
-vendor/
+# ★2026-09-25 修正★：必须锚定为 /vendor/（仅仓库根）。原先写 `vendor/` 会匹配任意层级，
+#   连 `demo/vendor/`（demo 本地化的 echarts/three 库）一起忽略 → 克隆后 demo 直接白屏。
+/vendor/
+
+# demo 自检产物（截图，不入库）；注意 demo/vendor/ 与 demo/assets/ 必须入库
+demo/_selfcheck/
 
 # Python 缓存
 __pycache__/

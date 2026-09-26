@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>契约自检 fixture</title>
+<style>body{font-family:"Microsoft YaHei",system-ui,sans-serif;margin:0;padding:20px;background:#fff;color:#1a1a1a}
+.screen{display:none}.screen.on{display:block}
+.v{font-size:22px;font-weight:500}.k{font-size:12px;color:#666}
+.nav{cursor:pointer;display:inline-block;padding:5px 12px;border:1px solid #ccc;border-radius:8px;font-size:13px;margin-right:6px}
+.badge{font-size:11px;color:#185FA5;border:1px solid #185FA5;border-radius:999px;padding:1px 6px}</style></head>
+<body>
+<div><a class="nav" data-goto="S1">S1</a><a class="nav" data-goto="S2">S2</a></div>
+
+<section class="screen on" data-screen="S1" data-runid="fixture_run_A">
+  <div class="k">切换总时延（本方案）</div>
+  <div class="v" id="a" data-metric="切换总时延" data-value="12.06">12.06 ms</div>
+  <div class="badge">run: fixture_run_A</div>
+  <div class="k" style="margin-top:10px">Rel-17 基线</div>
+  <div class="v" data-metric="基线" data-value="381.0">381.0 ms</div>
+</section>
+
+<section class="screen" data-screen="S2" data-runid="fixture_run_B">
+  <div class="k">接入时延均值（两步 RACH）</div>
+  <div class="v" data-metric="接入时延均值" data-value="193.44" id="b">193.44 ms</div>
+</section>
+
+<script>
+window.DEMO_DATA = {
+  generated_at: "2026-09-25T00:00:00Z",
+  metrics: { "切换总时延": 12.06, "基线": 381.0, "接入时延均值": 193.44 }
+};
+document.querySelectorAll('.nav').forEach(function(el){
+  el.addEventListener('click', function(){
+    var id = el.getAttribute('data-goto');
+    document.querySelectorAll('.screen').forEach(function(s){
+      s.classList.toggle('on', s.getAttribute('data-screen') === id);
+    });
+  });
+});
+</script>
+</body></html>
